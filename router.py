@@ -94,7 +94,9 @@ def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, 
             }
         )
 
-    if artifact_matches and session.latest_vision_description:
+    if session.latest_vision_description and (
+        artifact_matches or looks_like_artifact_follow_up(user_message)
+    ):
         messages.append(
             {
                 "role": "system",

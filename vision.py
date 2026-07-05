@@ -42,7 +42,7 @@ def validate_jpeg_upload(image_bytes: bytes, content_type: str | None) -> str:
         raise CameraUploadError("uploaded file is not a JPEG image")
     if not image_bytes.endswith(b"\xff\xd9"):
         raise CameraUploadError("JPEG image appears to be incomplete")
-    return normalized_content_type
+    return "image/jpeg"
 
 
 def save_camera_image(

@@ -19,6 +19,12 @@ from vision import (
     build_unrecognized_vision_result,
     save_camera_image,
 )
+from vision_llm import (
+    VisionConfigError,
+    VisionRecognitionError,
+    is_vision_configured,
+    recognize_artifact_from_image,
+)
 
 
 app = FastAPI(title="Minimal AI Chat Backend")
@@ -105,6 +111,7 @@ async def upload_camera_image(
     device: str = "default",
     artifact_id: str | None = None,
     vision_description: str | None = None,
+    use_vision: bool = True,
 ) -> dict[str, object]:
     device_id = normalize_device_id(device)
     normalized_artifact_id = (artifact_id or "").strip()
@@ -133,6 +140,29 @@ async def upload_camera_image(
             vision_description=str(recognition["vision_description"]),
             image_id=str(saved_image["image_id"]),
         )
+    elif use_vision and is_vision_configured():
+        try:
+            recognition = await recognize_artifact_from_image(
+                image_bytes=image_bytes,
+                content_type=str(saved_image["content_type"]),
+            )
+        except (VisionConfigError, VisionRecognitionError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        recognized_artifact_id = recognition.get("artifact_id")
+        if recognized_artifact_id:
+            session = set_artifact_context(
+                device_id=device_id,
+                artifact_id=str(recognized_artifact_id),
+                vision_description=str(recognition.get("vision_description") or ""),
+                image_id=str(saved_image["image_id"]),
+            )
+        else:
+            session = set_image_context(
+                device_id=device_id,
+                image_id=str(saved_image["image_id"]),
+                vision_description=recognition.get("vision_description"),
+            )
     else:
         recognition = build_unrecognized_vision_result(vision_description)
         session = set_image_context(

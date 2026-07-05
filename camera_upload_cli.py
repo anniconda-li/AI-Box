@@ -5,12 +5,20 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
-def build_url(base_url: str, device: str, artifact_id: str | None, vision_description: str | None) -> str:
+def build_url(
+    base_url: str,
+    device: str,
+    artifact_id: str | None,
+    vision_description: str | None,
+    use_vision: bool = True,
+) -> str:
     query = {"device": device}
     if artifact_id:
         query["artifact_id"] = artifact_id
     if vision_description:
         query["vision_description"] = vision_description
+    if not use_vision:
+        query["use_vision"] = "false"
     return f"{base_url.rstrip('/')}/camera/upload?{urlencode(query)}"
 
 
@@ -20,10 +28,11 @@ def upload_image(
     device: str,
     artifact_id: str | None,
     vision_description: str | None,
+    use_vision: bool,
 ) -> dict[str, object]:
     image_bytes = image_path.read_bytes()
     request = Request(
-        build_url(base_url, device, artifact_id, vision_description),
+        build_url(base_url, device, artifact_id, vision_description, use_vision),
         data=image_bytes,
         headers={"Content-Type": "image/jpeg"},
         method="POST",
@@ -41,6 +50,7 @@ def main() -> None:
     parser.add_argument("--device", default="walkie-01", help="Device id.")
     parser.add_argument("--artifact-id", help="Manual artifact id for simulated recognition.")
     parser.add_argument("--vision-description", help="Optional visual description.")
+    parser.add_argument("--no-vision", action="store_true", help="Save image without model recognition.")
     parser.add_argument("--url", default="http://127.0.0.1:8000", help="Backend base URL.")
     args = parser.parse_args()
 
@@ -53,6 +63,7 @@ def main() -> None:
         device=args.device,
         artifact_id=args.artifact_id,
         vision_description=args.vision_description,
+        use_vision=not args.no_vision,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

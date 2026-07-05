@@ -10,6 +10,7 @@
 - 按设备隔离的最近 10 轮内存 memory
 - 本地文物知识卡查询
 - 文物追问上下文继承
+- DashScope Qwen-VL 图片识别
 - 后端内部文物上下文模拟接口
 - 简单 tool 调用机制
 - OpenAI / DeepSeek / 其他 OpenAI-compatible 服务商
@@ -26,6 +27,7 @@
 ├── sessions.py       # 按 device_id 管理设备会话和 memory
 ├── artifacts.py      # 加载本地文物知识卡
 ├── vision.py         # 保存相机图片、模拟视觉识别结果
+├── vision_llm.py     # 调用 DashScope Qwen-VL 做候选约束识别
 ├── llm.py            # 封装 OpenAI-compatible streaming 调用
 ├── tools.py          # 示例 tool：get_device_status()
 ├── data/artifacts/   # 5 件核心文物的本地 JSON 知识卡
@@ -65,6 +67,8 @@
   -> vision.py 校验 Content-Type、大小和 JPEG 文件头
   -> vision.py 保存到 uploads/{device_id}/{image_id}.jpg
   -> main.py 如果带 artifact_id，则当作模拟识别结果
+  -> main.py 如果没带 artifact_id 且配置了 VISION，则调用 vision_llm.py
+  -> vision_llm.py 将图片和 5 件候选文物发给 Qwen-VL，要求返回 JSON
   -> sessions.py 写入 latest_image_id / latest_artifact_id / latest_vision_description
   -> 返回 ready
 ```
@@ -75,7 +79,8 @@
 - `router.py` 负责业务编排。
 - `sessions.py` 负责设备上下文、当前文物和短期记忆。
 - `artifacts.py` 负责加载和查询本地文物知识卡。
-- `vision.py` 负责图片保存和当前阶段的模拟视觉识别。
+- `vision.py` 负责图片保存和人工模拟识别结果。
+- `vision_llm.py` 负责调用视觉模型，当前支持 DashScope / 百炼 OpenAI-compatible 接口。
 - `llm.py` 负责模型调用。
 - `tools.py` 负责外部工具能力。
 - `chat_cli.py` 只是测试客户端，不参与后端核心逻辑。
@@ -108,6 +113,42 @@ DeepSeek 示例：
 OPENAI_API_KEY=your-deepseek-api-key
 OPENAI_MODEL=deepseek-v4-flash
 OPENAI_BASE_URL=https://api.deepseek.com
+```
+
+百炼视觉识别示例：
+
+```env
+VISION_PROVIDER=dashscope
+VISION_MODEL=qwen-vl-plus
+VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+VISION_API_KEY=your-dashscope-api-key
+VISION_MIN_CONFIDENCE=0.60
+```
+
+如果你习惯用 `DASHSCOPE_API_KEY`，也可以这样写：
+
+```env
+DASHSCOPE_API_KEY=your-dashscope-api-key
+```
+
+后续 ASR / TTS 会使用这些变量，目前只是先写入配置：
+
+```env
+ASR_PROVIDER=dashscope
+ASR_MODEL=paraformer-realtime-v2
+
+TTS_PROVIDER=dashscope
+TTS_MODEL=qwen3-tts-flash
+TTS_VOICE=Cherry
+```
+
+当前分工：
+
+```text
+DeepSeek / OPENAI_MODEL      -> 文本讲解和问答
+Qwen-VL / VISION_MODEL       -> 图片识别，输出 artifact_id
+Paraformer / ASR_MODEL       -> 语音转文字，后续接
+Qwen3-TTS / TTS_MODEL        -> 文字转语音，后续接
 ```
 
 OpenAI 官方示例：
@@ -191,7 +232,32 @@ You> /exit
 .\.venv\Scripts\python.exe chat_cli.py --device walkie-01 "what is the device status?"
 ```
 
-上传 ESP32 实拍样例图：
+使用真实视觉模型识别 ESP32 实拍样例图。注意：这里不要传 `--artifact-id`，后端会调用 `VISION_MODEL`：
+
+```powershell
+.\.venv\Scripts\python.exe camera_upload_cli.py `
+  samples\camera\yingguo_jade_eagle_esp32.jpg `
+  --device walkie-01
+```
+
+另一张样例图：
+
+```powershell
+.\.venv\Scripts\python.exe camera_upload_cli.py `
+  samples\camera\shuyao_chuilin_sheng_ding_esp32.jpg `
+  --device walkie-01
+```
+
+只保存图片、不调用视觉模型：
+
+```powershell
+.\.venv\Scripts\python.exe camera_upload_cli.py `
+  samples\camera\yingguo_jade_eagle_esp32.jpg `
+  --device walkie-01 `
+  --no-vision
+```
+
+也可以用人工标注对照模式。传了 `--artifact-id` 后，不会调用视觉模型，而是直接使用你指定的文物 id：
 
 ```powershell
 .\.venv\Scripts\python.exe camera_upload_cli.py `
@@ -201,7 +267,7 @@ You> /exit
   --vision-description "ESP32 实拍图：浅色玉质鹰形器，呈展翅姿态。"
 ```
 
-另一张样例图：
+人工标注另一张样例图：
 
 ```powershell
 .\.venv\Scripts\python.exe camera_upload_cli.py `
@@ -359,11 +425,26 @@ AI> 它是平顶山“鹰城”文化的重要象征……
 
 ### POST /camera/upload
 
-相机图片上传接口。当前阶段先做后端闭环，不接真实视觉模型：接口会保存 JPEG；如果请求里带 `artifact_id`，就把它当作人工指定的模拟识别结果，并写入该设备的最新文物上下文。
+相机图片上传接口。接口会保存 JPEG，并根据请求参数决定识别方式：
+
+- 不传 `artifact_id`：调用 `VISION_MODEL`，当前推荐 `qwen-vl-plus`。
+- 传 `artifact_id`：跳过视觉模型，把它当作人工指定的模拟识别结果，方便对照测试。
+- 传 `use_vision=false`：只保存图片，不识别，并清空该设备旧的 `latest_artifact_id`。
+
+如果没有配置 `VISION_API_KEY` 或 `DASHSCOPE_API_KEY`，不传 `artifact_id` 时也会退化成“只保存图片、不识别”。
 
 接口形态特意使用 raw JPEG body，而不是 multipart。这样以后 ESP32 C 端更容易对齐：HTTP body 直接发送 JPEG 字节即可。
 
-请求方式：
+真实视觉识别请求：
+
+```text
+POST /camera/upload?device=walkie-01
+Content-Type: image/jpeg
+
+<JPEG bytes>
+```
+
+人工标注对照请求：
 
 ```text
 POST /camera/upload?device=walkie-01&artifact_id=yingguo_jade_eagle
@@ -378,7 +459,7 @@ PowerShell 示例：
 $imageBytes = [System.IO.File]::ReadAllBytes("D:\test\artifact.jpg")
 
 Invoke-RestMethod `
-  -Uri "http://127.0.0.1:8000/camera/upload?device=walkie-01&artifact_id=yingguo_jade_eagle" `
+  -Uri "http://127.0.0.1:8000/camera/upload?device=walkie-01" `
   -Method POST `
   -ContentType "image/jpeg" `
   -Body $imageBytes
@@ -398,10 +479,13 @@ Invoke-RestMethod `
     "content_type": "image/jpeg"
   },
   "recognition": {
-    "mode": "manual_artifact_id",
+    "mode": "vision_llm",
     "artifact_id": "yingguo_jade_eagle",
     "artifact_name": "应国玉鹰",
-    "confidence": 1.0
+    "predicted_artifact_id": "yingguo_jade_eagle",
+    "confidence": 0.86,
+    "accepted": true,
+    "evidence": ["浅色玉质", "鹰形", "展翅", "线雕羽翼"]
   },
   "latest_artifact_id": "yingguo_jade_eagle",
   "latest_image_id": "20260705T120000000000Z_abcd1234",
@@ -420,14 +504,14 @@ You> 这是什么？
 AI> 这是应国玉鹰……
 ```
 
-如果不传 `artifact_id`，接口仍会保存图片并返回 `ready`，但会把该设备的 `latest_artifact_id` 清空，避免新图片未识别时还沿用旧文物上下文。
+如果视觉模型返回 `unknown`，或者置信度低于 `VISION_MIN_CONFIDENCE`，接口仍会返回 `ready`，但不会写入 `latest_artifact_id`，避免误把不确定图片当成某件文物。
 
 项目里已经放了两张 ESP32 实拍样例图：
 
 - `samples/camera/yingguo_jade_eagle_esp32.jpg`
 - `samples/camera/shuyao_chuilin_sheng_ding_esp32.jpg`
 
-它们是测试夹具，不是知识库事实。当前用人工 `artifact_id` 模拟识别结果，后续接入真实视觉模型后，要让模型自己从图片判断文物。
+它们是测试夹具，不是知识库事实。现在可以直接不传 `artifact_id` 测真实视觉识别，也可以传 `artifact_id` 做人工标注对照。
 
 ### GET /artifacts
 
@@ -515,7 +599,7 @@ LLM 只负责把已知事实组织成讲解语言
 讲讲应国玉鹰
 ```
 
-后端会匹配 `应国玉鹰`，并把 `yingguo_jade_eagle` 的知识卡拼进 messages。后续接入图像识别后，识别出的 `latest_artifact_id` 也会走同一套知识卡。
+后端会匹配 `应国玉鹰`，并把 `yingguo_jade_eagle` 的知识卡拼进 messages。`/camera/upload` 调用视觉模型识别出的 `latest_artifact_id` 也会走同一套知识卡。
 
 当用户明确提到某件文物时，`router.py` 会把该文物 id 保存到当前设备的 `session.latest_artifact_id`。如果下一轮用户没有再说文物名，而是问：
 
@@ -527,15 +611,17 @@ LLM 只负责把已知事实组织成讲解语言
 
 后端会判断这类句子像追问，并把 `latest_artifact_id` 对应的知识卡再次加入 LLM 上下文。这样回答不是单纯依赖上一轮 assistant 的文本记忆，而是明确继承“当前设备正在看的那件文物”。
 
-在还没接 ESP32 和视觉模型之前，可以使用：
+如果想绕过图片上传和视觉模型，仍然可以使用：
 
 ```text
 POST /sessions/{device_id}/artifact-context
 ```
 
-手动设置 `latest_artifact_id` 和 `latest_vision_description`。这就是后端内部模拟“拍照识别成功”的方式。等后续真的接入 `/camera/upload` 后，图片识别模块也会写入同样的 session 字段，聊天链路不用重写。
+手动设置 `latest_artifact_id` 和 `latest_vision_description`。这相当于后端内部模拟“拍照识别成功”，适合做对照测试。
 
-现在 `/camera/upload` 已经具备同样的状态写入能力：先保存 JPEG，再通过 `artifact_id` 模拟识别结果。真实视觉模型接入后，只需要把 `manual_artifact_id` 这一步替换成模型输出的 `artifact_id / confidence / evidence / vision_description`。
+现在 `/camera/upload` 已经具备同样的状态写入能力：先保存 JPEG；如果没有人工 `artifact_id`，就调用 `vision_llm.py`，把图片和 5 件候选文物的视觉特征发给 `VISION_MODEL`，并解析模型输出的 `artifact_id / confidence / evidence / vision_description`。
+
+视觉识别只使用候选文物的名称、别名、类别、材质、`visual_keywords` 和 `recognition_features`。历史事实和讲解文本仍由聊天阶段使用，避免视觉模型把“讲故事”混进识别任务。
 
 回答生成有一个重要约束：模型输出就是设备端直接展示给游客的内容。因此 prompt 明确要求模型不要输出“讲解时可以这样带”“你可以引导游客观察”这类内部指导语，而是直接生成游客可听可看的讲解文本。知识卡里的 `guide_notes` 只作为后端维护资料保留，当前不会传给模型，避免模型把内部讲解建议原样说给游客。
 
