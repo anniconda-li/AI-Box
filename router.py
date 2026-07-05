@@ -1,7 +1,7 @@
 import json
 import logging
 from time import perf_counter
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 from artifacts import ArtifactNotFoundError, find_artifacts_by_text, get_artifact, to_llm_context
 from llm import stream_chat_completion
@@ -158,3 +158,40 @@ async def chat_stream(user_message: str, device_id: str) -> AsyncIterator[str]:
         len(assistant_message),
         elapsed_ms(total_start),
     )
+
+
+async def chat_response(
+    user_message: str,
+    device_id: str,
+    should_continue: Callable[[], bool] | None = None,
+) -> str:
+    total_start = perf_counter()
+    session = get_session(device_id)
+    messages = build_messages(user_message, session)
+    chunks: list[str] = []
+    logger.info(
+        "chat_once.start device=%s input_chars=%d latest_artifact_id=%s",
+        device_id,
+        len(user_message),
+        session.latest_artifact_id,
+    )
+
+    async for token in stream_chat_completion(messages):
+        if should_continue is not None and not should_continue():
+            logger.info("chat_once.cancelled device=%s", device_id)
+            raise RuntimeError("chat cancelled")
+        chunks.append(token)
+
+    if should_continue is not None and not should_continue():
+        logger.info("chat_once.cancelled device=%s", device_id)
+        raise RuntimeError("chat cancelled")
+
+    assistant_message = "".join(chunks)
+    remember_turn(session, user_message, assistant_message)
+    logger.info(
+        "chat_once.done device=%s output_chars=%d total_ms=%.1f",
+        device_id,
+        len(assistant_message),
+        elapsed_ms(total_start),
+    )
+    return assistant_message

@@ -2,10 +2,22 @@ import logging
 import os
 from time import perf_counter
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
+from ai_protocol import (
+    AI_CHUNK_SIZE,
+    AiProtocolError,
+    ai_result_info,
+    cancel_ai_session,
+    create_ai_session,
+    finish_ai_upload,
+    get_ai_session,
+    read_ai_result_chunk,
+    stop_ai_audio,
+    write_ai_upload_chunk,
+)
 from artifacts import ArtifactNotFoundError, get_artifact, list_artifacts
 from llm import validate_llm_config
 from router import chat_stream
@@ -59,6 +71,11 @@ class ArtifactContextRequest(BaseModel):
     artifact_id: str
     vision_description: str | None = None
     image_id: str | None = None
+
+
+class AiStartRequest(BaseModel):
+    device: str
+    language: str = "zh"
 
 
 @app.get("/health")
@@ -299,6 +316,90 @@ async def upload_camera_image(
         "latest_vision_description": session.latest_vision_description,
         "upload_generation": session.upload_generation,
     }
+
+
+def raise_ai_http_error(exc: AiProtocolError) -> None:
+    raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+@app.post("/ai/start")
+async def ai_start(request: AiStartRequest) -> dict[str, object]:
+    session = create_ai_session(request.device, request.language)
+    return {"session": session.session_id, "chunk_size": AI_CHUNK_SIZE}
+
+
+@app.post("/ai/upload")
+async def ai_upload(
+    request: Request,
+    session: str,
+    index: int,
+    offset: int,
+    total: int,
+    device: str | None = None,
+) -> dict[str, object]:
+    try:
+        chunk = await request.body()
+        return write_ai_upload_chunk(
+            session,
+            chunk,
+            index=index,
+            offset=offset,
+            total=total,
+            device=device,
+        )
+    except AiProtocolError as exc:
+        raise_ai_http_error(exc)
+
+
+@app.post("/ai/finish")
+async def ai_finish(session: str, device: str | None = None) -> dict[str, object]:
+    try:
+        return finish_ai_upload(session, device=device)
+    except AiProtocolError as exc:
+        raise_ai_http_error(exc)
+
+
+@app.post("/ai/result_info")
+async def ai_result_info_endpoint(
+    session: str, device: str | None = None
+) -> dict[str, object]:
+    try:
+        ai_session = get_ai_session(session)
+        if device is not None and normalize_device_id(device) != ai_session.device_id:
+            raise AiProtocolError(409, "device does not match session")
+        return ai_result_info(ai_session)
+    except AiProtocolError as exc:
+        raise_ai_http_error(exc)
+
+
+@app.post("/ai/result_chunk")
+async def ai_result_chunk(
+    session: str,
+    offset: int = 0,
+    length: int = Query(32768, alias="len"),
+    device: str | None = None,
+) -> Response:
+    try:
+        chunk = read_ai_result_chunk(session, offset=offset, length=length, device=device)
+        return Response(content=chunk, media_type="audio/wav")
+    except AiProtocolError as exc:
+        raise_ai_http_error(exc)
+
+
+@app.post("/ai/cancel")
+async def ai_cancel(session: str, device: str | None = None) -> dict[str, object]:
+    try:
+        return cancel_ai_session(session, device=device)
+    except AiProtocolError as exc:
+        raise_ai_http_error(exc)
+
+
+@app.post("/ai/stop_audio")
+async def ai_stop_audio(session: str, device: str | None = None) -> dict[str, object]:
+    try:
+        return stop_ai_audio(session, device=device)
+    except AiProtocolError as exc:
+        raise_ai_http_error(exc)
 
 
 @app.post("/chat")

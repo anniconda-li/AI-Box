@@ -6,6 +6,7 @@
 
 - `/chat` 聊天接口
 - `/camera/upload` JPEG 图片上传接口
+- `/ai/*` ESP32 语音分片上传、轮询结果、按需拉取 WAV 协议骨架
 - 模型 streaming 输出
 - 按设备隔离的最近 10 轮内存 memory
 - 本地文物知识卡查询
@@ -22,7 +23,9 @@
 
 ```text
 .
-├── main.py           # FastAPI app，定义 /health 和 /chat
+├── main.py           # FastAPI app，定义 HTTP 接口
+├── ai_protocol.py    # ESP32 /ai 语音协议、session、分片、取消状态
+├── wav_utils.py      # 设备 WAV 格式校验和测试 WAV 生成
 ├── router.py         # 组装上下文、memory、tool 判断、流式转发
 ├── sessions.py       # 按 device_id 管理设备会话和 memory
 ├── artifacts.py      # 加载本地文物知识卡
@@ -50,7 +53,7 @@
   -> sessions.py 获取该 device 的会话
   -> router.py 构造 messages
   -> router.py 如果识别到文物名称，则加入本地知识卡
-  -> router.py 如果是“它/这件/继续讲”等追问，则继承该设备上一件文物
+  -> router.py 如果该设备已有 latest_artifact_id，则默认继承当前文物
   -> router.py 如果该设备有最新视觉描述，则作为辅助视觉上下文加入
   -> router.py 判断是否需要调用 tool
   -> llm.py 调用模型 API，stream=True
@@ -73,9 +76,26 @@
   -> 返回 ready
 ```
 
+一次 ESP32 语音请求的协议流程：
+
+```text
+设备 POST /ai/start，提交 device 和 language
+  -> ai_protocol.py 创建语音 session，返回 session 和 chunk_size
+设备 POST /ai/upload 分片上传 WAV
+  -> ai_protocol.py 按 session + offset 写入 uploads/ai/{device}/{session}/request.wav
+设备 POST /ai/finish
+  -> 后端立即返回当前状态，并在后台处理 ASR / LLM / TTS
+设备 POST /ai/result_info 每秒轮询
+  -> 文本先完成时返回 answer_text
+  -> TTS 完成时返回 reply_wav_size
+设备 POST /ai/result_chunk 按 offset/len 拉取原始 WAV bytes
+```
+
 核心点：
 
 - `main.py` 负责 HTTP 接口。
+- `ai_protocol.py` 负责 ESP32 语音协议状态机。
+- `wav_utils.py` 负责校验设备要求的 WAV 格式。
 - `router.py` 负责业务编排。
 - `sessions.py` 负责设备上下文、当前文物和短期记忆。
 - `artifacts.py` 负责加载和查询本地文物知识卡。
@@ -566,6 +586,204 @@ AI> 这是应国玉鹰……
 
 它们是测试夹具，不是知识库事实。现在可以直接不传 `artifact_id` 测真实视觉识别，也可以传 `artifact_id` 做人工标注对照。
 
+### POST /ai/start
+
+ESP32 语音协议入口。当前后端已经实现协议骨架、分片保存、轮询状态、取消语义和 `result_chunk` 原始 WAV 返回；真实 ASR/TTS 还没有接入。
+
+请求：
+
+```json
+{"device":"walkie-02","language":"zh"}
+```
+
+响应：
+
+```json
+{"session":"abc123","chunk_size":8192}
+```
+
+后端会用 `device` 绑定语音 session。后续 `/ai/upload`、`/ai/finish`、`/ai/result_info`、`/ai/result_chunk` 即使只传 `session` 也能找到设备上下文；如果设备端额外带 `device=walkie-02`，后端会校验它和 session 里的设备是否一致。
+
+### POST /ai/upload
+
+上传请求 WAV 分片。所有接口都用 POST。
+
+```text
+POST /ai/upload?session=abc123&device=walkie-02&index=0&offset=0&total=1920044
+Content-Type: application/octet-stream
+
+<WAV bytes chunk>
+```
+
+响应：
+
+```json
+{"ok":true}
+```
+
+后端按 `session + offset` 写入文件，当前最大请求 WAV 约 2.1 MB。设备 WAV 必须保持：
+
+```text
+Container: WAV
+Codec: PCM
+Sample rate: 16000 Hz
+Bit depth: 16-bit
+Channels: mono
+Endian: little-endian
+```
+
+### POST /ai/finish
+
+通知上传完成并启动后台处理。这个接口会快速返回，设备端即使遇到响应超时，也可以继续轮询 `/ai/result_info`。
+
+```text
+POST /ai/finish?session=abc123&device=walkie-02
+```
+
+当前版本的处理策略：
+
+- 如果 WAV 无效，返回 `failed`。
+- 如果 WAV 太短或接近静音，返回 `no_speech`，`answer_text` 默认为“我没有听清，请再说一遍。”。
+- 如果没有配置 `AI_MOCK_ASR_TEXT`，有效语音也会暂时返回 `no_speech`，避免设备一直轮询。
+- 如果配置了 `AI_MOCK_ASR_TEXT`，后端会用这段文本调用现有 LLM 编排。
+- 真实 TTS 尚未接入，默认在文本生成后返回 `audio_failed`，但保留 `answer_text`。
+- 如果 `AI_ENABLE_MOCK_TTS=true`，会生成一个 16k/16-bit/mono PCM WAV 静音文件，用来测试 `result_chunk`。
+
+本地联调可以在 `.env` 里临时加：
+
+```env
+AI_MOCK_ASR_TEXT=这是什么
+AI_MOCK_LLM_TEXT=这是一个本地模拟回答，用来测试设备端轮询和音频拉取。
+AI_ENABLE_MOCK_TTS=true
+```
+
+### POST /ai/result_info
+
+设备轮询结果。
+
+```text
+POST /ai/result_info?session=abc123&device=walkie-02
+Content-Type: application/json
+
+{}
+```
+
+文本先就绪时：
+
+```json
+{
+  "ok": true,
+  "session": "abc123",
+  "device": "walkie-02",
+  "status": "text_ready",
+  "asr_text": "这是什么",
+  "answer_text": "这是应国玉鹰……",
+  "audio_ready": false,
+  "reply_wav_ready": false,
+  "reply_wav_size": 0,
+  "tts_status": "pending",
+  "tts_error": null
+}
+```
+
+语音就绪时：
+
+```json
+{
+  "ok": true,
+  "session": "abc123",
+  "status": "audio_ready",
+  "answer_text": "这是应国玉鹰……",
+  "audio_ready": true,
+  "reply_wav_ready": true,
+  "reply_wav_size": 12844,
+  "tts_status": "done",
+  "tts_error": null
+}
+```
+
+静音或空语音：
+
+```json
+{
+  "ok": true,
+  "session": "abc123",
+  "status": "no_speech",
+  "asr_text": "",
+  "answer_text": "我没有听清，请再说一遍。",
+  "audio_ready": false,
+  "reply_wav_ready": false,
+  "reply_wav_size": 0,
+  "tts_status": "skipped",
+  "tts_error": null
+}
+```
+
+TTS 失败但文本保留：
+
+```json
+{
+  "ok": true,
+  "session": "abc123",
+  "status": "audio_failed",
+  "answer_text": "这是应国玉鹰……",
+  "audio_ready": false,
+  "reply_wav_ready": false,
+  "reply_wav_size": 0,
+  "tts_status": "failed",
+  "tts_error": "TTS is not implemented yet"
+}
+```
+
+`no_speech`、`audio_failed`、`cancelled`、`failed` 都是终态，设备端不应该继续轮询到 300 秒超时。
+
+### POST /ai/result_chunk
+
+按需拉取回复 WAV。响应 body 是原始 WAV 字节，不是 JSON，也不是 Base64。
+
+```text
+POST /ai/result_chunk?session=abc123&device=walkie-02&offset=0&len=32768
+Content-Type: application/json
+
+{}
+```
+
+后端按 `offset + len` 精确读取，最后一片由设备按剩余长度请求。只有 `status == "audio_ready"` 且 `audio_ready == true` 时才应该调用。
+
+### POST /ai/cancel
+
+通用取消，表示用户放弃当前这次 AI 任务。
+
+```text
+POST /ai/cancel?session=abc123&device=walkie-02
+```
+
+后端会标记：
+
+```json
+{
+  "ok": true,
+  "session": "abc123",
+  "status": "cancelled",
+  "audio_ready": false,
+  "reply_wav_ready": false,
+  "reply_wav_size": 0,
+  "tts_status": "cancelled"
+}
+```
+
+取消后的旧 session 结果不会写成可播放音频。第三方 API 调用如果已经发出，当前版本不强杀，但结果回来后会根据 `cancel_requested` 丢弃。
+
+### POST /ai/stop_audio
+
+只停止回复音频播放或拉取，不取消整次问答，不清空 `answer_text`。
+
+```text
+POST /ai/stop_audio?session=abc123&device=walkie-02
+```
+
+如果 TTS 还没开始或正在生成，后端会把 `tts_status` 标记为 `stopped`。如果音频已经生成，后端不会删除文本回答；设备端仍应以本地播放状态为准。
+
 ### GET /artifacts
 
 查看本地文物知识卡列表。
@@ -878,5 +1096,7 @@ $imageBytes = [System.IO.File]::ReadAllBytes("D:\test\artifact.jpg")
 - 没有前端页面
 - tool 是 mock 数据
 - memory 重启后丢失
+- `/ai/*` 已有设备协议骨架，但真实 ASR/TTS 尚未接入
+- `AI_ENABLE_MOCK_TTS=true` 生成的是测试静音 WAV，不是真实语音合成
 
 这些限制是刻意保留的，目的是让这个项目作为最小学习版本，先看清 LLM 后端的基本骨架。
