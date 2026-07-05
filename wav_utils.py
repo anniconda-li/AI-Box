@@ -1,6 +1,9 @@
 import audioop
 import math
+import os
+import shutil
 import sys
+import subprocess
 import tempfile
 import wave
 from array import array
@@ -14,6 +17,13 @@ WAV_CHANNELS = 1
 
 class WavFormatError(ValueError):
     pass
+
+
+def find_ffmpeg() -> str | None:
+    configured = os.getenv("FFMPEG_BIN", "").strip()
+    if configured:
+        return configured
+    return shutil.which("ffmpeg")
 
 
 def validate_device_wav(path: Path) -> dict[str, int | float]:
@@ -127,6 +137,62 @@ def convert_wav_to_device_format(source_path: Path, target_path: Path) -> dict[s
             target.setframerate(WAV_SAMPLE_RATE)
             target.writeframes(frames)
         temp_path.replace(target_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+    return validate_device_wav(target_path)
+
+
+def convert_audio_to_device_wav(source_path: Path, target_path: Path) -> dict[str, int | float]:
+    ffmpeg = find_ffmpeg()
+    if ffmpeg:
+        return convert_audio_to_device_wav_with_ffmpeg(ffmpeg, source_path, target_path)
+    return convert_wav_to_device_format(source_path, target_path)
+
+
+def convert_audio_to_device_wav_with_ffmpeg(
+    ffmpeg: str,
+    source_path: Path,
+    target_path: Path,
+) -> dict[str, int | float]:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        suffix=".wav",
+        dir=str(target_path.parent),
+        delete=False,
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source_path),
+        "-ac",
+        str(WAV_CHANNELS),
+        "-ar",
+        str(WAV_SAMPLE_RATE),
+        "-sample_fmt",
+        "s16",
+        "-acodec",
+        "pcm_s16le",
+        "-f",
+        "wav",
+        str(temp_path),
+    ]
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+            raise WavFormatError(f"ffmpeg failed: {detail[:1000]}")
+        temp_path.replace(target_path)
+    except FileNotFoundError as exc:
+        raise WavFormatError(f"ffmpeg not found: {ffmpeg}") from exc
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise

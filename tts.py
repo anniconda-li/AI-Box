@@ -5,10 +5,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from wav_utils import WavFormatError, convert_wav_to_device_format, validate_device_wav, write_silence_wav
+from wav_utils import WavFormatError, convert_audio_to_device_wav, validate_device_wav, write_silence_wav
 
 
 DEFAULT_TTS_ENDPOINT_PATH = "/audio/speech"
+DASHSCOPE_QWEN_TTS_ENDPOINT = (
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+)
 DASHSCOPE_QWEN_TTS_PATH = "/services/aigc/multimodal-generation/generation"
 
 
@@ -136,15 +139,11 @@ def get_dashscope_tts_base_url() -> str:
         or ""
     ).strip()
     if not base_url:
-        raise TtsConfigError(
-            "DashScope Qwen-TTS requires TTS_BASE_URL, for example "
-            "https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1"
-        )
+        return "https://dashscope.aliyuncs.com/api/v1"
     if "compatible-mode" in base_url:
         raise TtsConfigError(
             "TTS_BASE_URL for Qwen-TTS cannot be the compatible-mode URL. "
-            "Use the Model Studio workspace URL, for example "
-            "https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1"
+            "Remove TTS_BASE_URL to use the default DashScope API, or set TTS_ENDPOINT explicitly."
         )
     return base_url.rstrip("/")
 
@@ -156,7 +155,11 @@ def request_dashscope_qwen_tts(text: str) -> bytes:
     timeout = float(os.getenv("TTS_TIMEOUT_SECONDS", "120"))
     endpoint = os.getenv("TTS_ENDPOINT", "").strip()
     if not endpoint:
-        endpoint = f"{get_dashscope_tts_base_url()}{DASHSCOPE_QWEN_TTS_PATH}"
+        base_url = get_dashscope_tts_base_url()
+        if base_url == "https://dashscope.aliyuncs.com/api/v1":
+            endpoint = DASHSCOPE_QWEN_TTS_ENDPOINT
+        else:
+            endpoint = f"{base_url}{DASHSCOPE_QWEN_TTS_PATH}"
 
     payload: dict[str, object] = {
         "model": model,
@@ -230,7 +233,7 @@ def save_tts_response_as_device_wav(raw_audio: bytes, output_path: Path) -> dict
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        suffix=".wav",
+        suffix=".audio",
         dir=str(output_path.parent),
         delete=False,
     ) as temp_file:
@@ -239,11 +242,11 @@ def save_tts_response_as_device_wav(raw_audio: bytes, output_path: Path) -> dict
 
     try:
         try:
-            wav_info = convert_wav_to_device_format(temp_path, output_path)
+            wav_info = convert_audio_to_device_wav(temp_path, output_path)
         except WavFormatError as exc:
             raise TtsError(
-                "TTS response is not a convertible PCM WAV. "
-                "Set TTS_RESPONSE_FORMAT=wav, or add an audio transcoder before ESP32 playback."
+                "TTS response could not be converted to ESP32 WAV. "
+                "Install ffmpeg or set FFMPEG_BIN to convert MP3/AAC/non-PCM audio."
             ) from exc
     finally:
         temp_path.unlink(missing_ok=True)

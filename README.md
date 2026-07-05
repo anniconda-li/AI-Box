@@ -187,23 +187,28 @@ TTS_API_STYLE=dashscope_qwen
 TTS_MODEL=qwen3-tts-flash
 TTS_VOICE=Cherry
 TTS_LANGUAGE_TYPE=Chinese
-TTS_BASE_URL=https://你的-workspace-id.cn-beijing.maas.aliyuncs.com/api/v1
 TTS_TIMEOUT_SECONDS=120
 ```
 
-`TTS_API_KEY` 默认复用 `DASHSCOPE_API_KEY`。但 `TTS_BASE_URL` 不能复用 `DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1`，Qwen3-TTS 需要百炼业务空间的 `api/v1` 地址，例如：
+`TTS_API_KEY` 默认复用 `DASHSCOPE_API_KEY`。Qwen3-TTS 默认请求百炼公共 API：
 
 ```text
-https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1
+https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
 ```
 
-当前 TTS 默认请求：
+一般不需要配置 `TTS_BASE_URL`。如果以后换私有 endpoint，可以用 `TTS_ENDPOINT` 完整覆盖。
+
+真实 TTS 可能返回 WAV、MP3 或其他常见音频。后端会优先使用 `ffmpeg` 统一转成 ESP32 要的格式：
 
 ```text
-{TTS_BASE_URL}/services/aigc/multimodal-generation/generation
+WAV / PCM s16le / 16000 Hz / mono
 ```
 
-如果服务商路径不同，可以用 `TTS_ENDPOINT` 完整覆盖。百炼官方文档的 Qwen-TTS 非流式输出会先返回音频 URL，后端会下载这个 URL，再统一转成 ESP32 要的 16k/16-bit/mono PCM WAV。
+如果 `ffmpeg` 不在 PATH，可以在 `.env` 里指定：
+
+```env
+FFMPEG_BIN=D:\tools\ffmpeg\bin\ffmpeg.exe
+```
 
 当前分工：
 
@@ -434,10 +439,9 @@ AI_ENABLE_MOCK_TTS=true
 
 ```env
 AI_ENABLE_MOCK_TTS=false
-TTS_BASE_URL=https://你的-workspace-id.cn-beijing.maas.aliyuncs.com/api/v1
 ```
 
-`TTS_BASE_URL` 必须是百炼业务空间地址，不能是 `https://dashscope.aliyuncs.com/compatible-mode/v1`。
+不需要配置 `TTS_BASE_URL`。如果真实 TTS 返回 MP3 或非 PCM WAV，建议安装 `ffmpeg`，或者在 `.env` 里设置 `FFMPEG_BIN`。
 
 ## 手动 HTTP 测试
 
