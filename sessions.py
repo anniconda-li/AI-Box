@@ -60,6 +60,20 @@ def set_artifact_context(
     return session
 
 
+def set_image_context(
+    device_id: str | None,
+    image_id: str,
+    vision_description: str | None = None,
+) -> DeviceSession:
+    session = get_session(device_id)
+    session.upload_generation += 1
+    session.latest_image_id = image_id
+    session.latest_vision_description = vision_description
+    session.latest_artifact_id = None
+    touch_session(session)
+    return session
+
+
 def clear_session(device_id: str | None) -> None:
     session = get_session(device_id)
     session.memory.clear()

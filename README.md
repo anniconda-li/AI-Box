@@ -5,6 +5,7 @@
 当前版本已经支持：
 
 - `/chat` 聊天接口
+- `/camera/upload` JPEG 图片上传接口
 - 模型 streaming 输出
 - 按设备隔离的最近 10 轮内存 memory
 - 本地文物知识卡查询
@@ -24,9 +25,11 @@
 ├── router.py         # 组装上下文、memory、tool 判断、流式转发
 ├── sessions.py       # 按 device_id 管理设备会话和 memory
 ├── artifacts.py      # 加载本地文物知识卡
+├── vision.py         # 保存相机图片、模拟视觉识别结果
 ├── llm.py            # 封装 OpenAI-compatible streaming 调用
 ├── tools.py          # 示例 tool：get_device_status()
 ├── data/artifacts/   # 5 件核心文物的本地 JSON 知识卡
+├── uploads/          # 本地上传图片目录，git 忽略
 ├── chat_cli.py       # 终端聊天客户端，方便本地测试
 ├── requirements.txt  # Python 依赖
 ├── .env.example      # 环境变量示例，不放真实 key
@@ -52,12 +55,25 @@
   -> router.py 把本轮 user/assistant 存入 memory
 ```
 
+一次图片上传的完整流程：
+
+```text
+设备或本地测试脚本 POST /camera/upload?device=walkie-01
+  -> main.py 读取 raw JPEG body
+  -> vision.py 校验 Content-Type、大小和 JPEG 文件头
+  -> vision.py 保存到 uploads/{device_id}/{image_id}.jpg
+  -> main.py 如果带 artifact_id，则当作模拟识别结果
+  -> sessions.py 写入 latest_image_id / latest_artifact_id / latest_vision_description
+  -> 返回 ready
+```
+
 核心点：
 
 - `main.py` 负责 HTTP 接口。
 - `router.py` 负责业务编排。
 - `sessions.py` 负责设备上下文、当前文物和短期记忆。
 - `artifacts.py` 负责加载和查询本地文物知识卡。
+- `vision.py` 负责图片保存和当前阶段的模拟视觉识别。
 - `llm.py` 负责模型调用。
 - `tools.py` 负责外部工具能力。
 - `chat_cli.py` 只是测试客户端，不参与后端核心逻辑。
@@ -307,6 +323,71 @@ You> 它对平顶山市有什么重要意义？
 AI> 它是平顶山“鹰城”文化的重要象征……
 ```
 
+### POST /camera/upload
+
+相机图片上传接口。当前阶段先做后端闭环，不接真实视觉模型：接口会保存 JPEG；如果请求里带 `artifact_id`，就把它当作人工指定的模拟识别结果，并写入该设备的最新文物上下文。
+
+接口形态特意使用 raw JPEG body，而不是 multipart。这样以后 ESP32 C 端更容易对齐：HTTP body 直接发送 JPEG 字节即可。
+
+请求方式：
+
+```text
+POST /camera/upload?device=walkie-01&artifact_id=yingguo_jade_eagle
+Content-Type: image/jpeg
+
+<JPEG bytes>
+```
+
+PowerShell 示例：
+
+```powershell
+$imageBytes = [System.IO.File]::ReadAllBytes("D:\test\artifact.jpg")
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/camera/upload?device=walkie-01&artifact_id=yingguo_jade_eagle" `
+  -Method POST `
+  -ContentType "image/jpeg" `
+  -Body $imageBytes
+```
+
+返回示例：
+
+```json
+{
+  "status": "ready",
+  "device_id": "walkie-01",
+  "image": {
+    "image_id": "20260705T120000000000Z_abcd1234",
+    "filename": "20260705T120000000000Z_abcd1234.jpg",
+    "path": "D:\\develop\\Projects\\AI-Box\\uploads\\walkie-01\\20260705T120000000000Z_abcd1234.jpg",
+    "size_bytes": 123456,
+    "content_type": "image/jpeg"
+  },
+  "recognition": {
+    "mode": "manual_artifact_id",
+    "artifact_id": "yingguo_jade_eagle",
+    "artifact_name": "应国玉鹰",
+    "confidence": 1.0
+  },
+  "latest_artifact_id": "yingguo_jade_eagle",
+  "latest_image_id": "20260705T120000000000Z_abcd1234",
+  "upload_generation": 1
+}
+```
+
+上传成功后，可以直接用同一个设备 id 追问：
+
+```powershell
+.\.venv\Scripts\python.exe chat_cli.py --device walkie-01
+```
+
+```text
+You> 这是什么？
+AI> 这是应国玉鹰……
+```
+
+如果不传 `artifact_id`，接口仍会保存图片并返回 `ready`，但会把该设备的 `latest_artifact_id` 清空，避免新图片未识别时还沿用旧文物上下文。
+
 ### GET /artifacts
 
 查看本地文物知识卡列表。
@@ -354,6 +435,13 @@ Invoke-RestMethod http://127.0.0.1:8000/artifacts/yingguo_jade_eagle
       "url": "https://www.news.cn/shuhua/20211116/a840ac11f5d243ccb34457ef307d8ae8/c.html"
     }
   ],
+  "reference_images": [
+    {
+      "title": "白玉线雕鹰（图①）",
+      "source_page": "https://www.news.cn/shuhua/20211116/a840ac11f5d243ccb34457ef307d8ae8/c.html",
+      "credit": "图片由平顶山博物馆提供"
+    }
+  ],
   "data_status": "public_web_enriched"
 }
 ```
@@ -373,6 +461,7 @@ LLM 只负责把已知事实组织成讲解语言
 - `visual_keywords` 和 `recognition_features`：后续图像识别和本地匹配会用到。
 - `guide_notes`：后端维护用提示，当前不会传给模型。
 - `source_urls` 和 `source_note`：资料溯源和复核提示，当前不会传给模型。
+- `reference_images`：公开图片来源记录，供后续人工核对、参考图整理或检索素材使用，当前不会传给模型。
 - `data_status`：标记资料状态，例如 `public_web_enriched`。
 
 注意：传给模型的事实文本必须是游客可接受的表达，不要出现“种子数据卡”“内部配置”“讲解时可以”这类工程或运营内部措辞。
@@ -404,6 +493,8 @@ POST /sessions/{device_id}/artifact-context
 ```
 
 手动设置 `latest_artifact_id` 和 `latest_vision_description`。这就是后端内部模拟“拍照识别成功”的方式。等后续真的接入 `/camera/upload` 后，图片识别模块也会写入同样的 session 字段，聊天链路不用重写。
+
+现在 `/camera/upload` 已经具备同样的状态写入能力：先保存 JPEG，再通过 `artifact_id` 模拟识别结果。真实视觉模型接入后，只需要把 `manual_artifact_id` 这一步替换成模型输出的 `artifact_id / confidence / evidence / vision_description`。
 
 回答生成有一个重要约束：模型输出就是设备端直接展示给游客的内容。因此 prompt 明确要求模型不要输出“讲解时可以这样带”“你可以引导游客观察”这类内部指导语，而是直接生成游客可听可看的讲解文本。知识卡里的 `guide_notes` 只作为后端维护资料保留，当前不会传给模型，避免模型把内部讲解建议原样说给游客。
 

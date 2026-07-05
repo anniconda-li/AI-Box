@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -11,6 +11,13 @@ from sessions import (
     normalize_device_id,
     session_snapshot,
     set_artifact_context,
+    set_image_context,
+)
+from vision import (
+    CameraUploadError,
+    build_manual_vision_result,
+    build_unrecognized_vision_result,
+    save_camera_image,
 )
 
 
@@ -86,6 +93,60 @@ async def set_device_artifact_context(
         "device_id": session.device_id,
         "latest_artifact_id": session.latest_artifact_id,
         "latest_artifact_name": artifact["name"],
+        "latest_image_id": session.latest_image_id,
+        "latest_vision_description": session.latest_vision_description,
+        "upload_generation": session.upload_generation,
+    }
+
+
+@app.post("/camera/upload")
+async def upload_camera_image(
+    request: Request,
+    device: str = "default",
+    artifact_id: str | None = None,
+    vision_description: str | None = None,
+) -> dict[str, object]:
+    device_id = normalize_device_id(device)
+    normalized_artifact_id = (artifact_id or "").strip()
+    artifact = None
+    if normalized_artifact_id:
+        try:
+            artifact = get_artifact(normalized_artifact_id)
+        except ArtifactNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="artifact not found") from exc
+
+    image_bytes = await request.body()
+    try:
+        saved_image = save_camera_image(
+            device_id=device_id,
+            image_bytes=image_bytes,
+            content_type=request.headers.get("content-type"),
+        )
+    except CameraUploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if artifact is not None:
+        recognition = build_manual_vision_result(artifact, vision_description)
+        session = set_artifact_context(
+            device_id=device_id,
+            artifact_id=normalized_artifact_id,
+            vision_description=str(recognition["vision_description"]),
+            image_id=str(saved_image["image_id"]),
+        )
+    else:
+        recognition = build_unrecognized_vision_result(vision_description)
+        session = set_image_context(
+            device_id=device_id,
+            image_id=str(saved_image["image_id"]),
+            vision_description=recognition["vision_description"],
+        )
+
+    return {
+        "status": "ready",
+        "device_id": session.device_id,
+        "image": saved_image,
+        "recognition": recognition,
+        "latest_artifact_id": session.latest_artifact_id,
         "latest_image_id": session.latest_image_id,
         "latest_vision_description": session.latest_vision_description,
         "upload_generation": session.upload_generation,

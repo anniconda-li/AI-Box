@@ -32,5 +32,12 @@
       "url": "https://www.news.cn/shuhua/20211116/a840ac11f5d243ccb34457ef307d8ae8/c.html"
     }
   ],
+  "reference_images": [
+    {
+      "title": "邓公簋（图⑥）",
+      "source_page": "https://www.news.cn/shuhua/20211116/a840ac11f5d243ccb34457ef307d8ae8/c.html",
+      "credit": "图片由平顶山博物馆提供，载于新华网/人民日报《平顶山博物馆文物解码》"
+    }
+  ],
   "data_status": "public_web_enriched"
 }
