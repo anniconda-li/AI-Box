@@ -41,7 +41,7 @@
 ├── llm.py            # 封装 OpenAI-compatible streaming 调用
 ├── tools.py          # 示例 tool：get_device_status()
 ├── data/artifacts/   # 5 件核心文物的本地 JSON 知识卡
-├── uploads/          # 本地上传图片目录，git 忽略
+├── uploads/          # 本地上传图片目录，git 忽略，每台设备默认只保留最近 10 张
 ├── outputs/          # 本地生成回复 WAV 目录，git 忽略
 ├── samples/camera/   # ESP32 实拍测试图片
 ├── chat_cli.py       # 终端聊天客户端，方便本地测试
@@ -79,6 +79,7 @@
   -> main.py 读取 raw JPEG body
   -> vision.py 校验 Content-Type、大小和 JPEG 文件头
   -> vision.py 保存到 uploads/{device_id}/{image_id}.jpg
+  -> vision.py 清理该设备目录下较旧图片，默认只保留最近 10 张
   -> main.py 如果带 artifact_id，则当作模拟识别结果
   -> main.py 如果没带 artifact_id 且配置了 VISION，则调用 vision_llm.py
   -> vision_llm.py 将图片和 5 件候选文物发给 Qwen-VL，要求返回 JSON
@@ -174,6 +175,7 @@ DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 VISION_PROVIDER=dashscope
 VISION_MODEL=qwen-vl-plus
 VISION_MIN_CONFIDENCE=0.60
+MAX_SAVED_IMAGES_PER_DEVICE=10
 ```
 
 一般不需要单独写 `VISION_API_KEY` 或 `VISION_BASE_URL`，它们会默认复用 `DASHSCOPE_API_KEY` 和 `DASHSCOPE_BASE_URL`。只有当视觉模型想换到另一个服务商或另一个百炼 endpoint 时，才需要覆盖：
@@ -623,6 +625,14 @@ AI> 它是平顶山“鹰城”文化的重要象征……
 - 传 `use_vision=false`：只保存图片，不识别，并清空该设备旧的 `latest_artifact_id`。
 
 如果没有配置 `VISION_API_KEY` 或 `DASHSCOPE_API_KEY`，不传 `artifact_id` 时也会退化成“只保存图片、不识别”。
+
+为了避免服务器磁盘一直增长，后端会按设备清理旧图片。默认每台设备只保留最近 10 张上传图片，可通过 `.env` 调整：
+
+```env
+MAX_SAVED_IMAGES_PER_DEVICE=10
+```
+
+清理只针对 `uploads/{device_id}/` 下的 `.jpg` 图片，不会影响语音请求和回复 WAV。
 
 接口形态特意使用 raw JPEG body，而不是 multipart。这样以后 ESP32 C 端更容易对齐：HTTP body 直接发送 JPEG 字节即可。
 

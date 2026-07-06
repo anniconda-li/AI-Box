@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+import logging
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -14,6 +16,8 @@ SUPPORTED_IMAGE_CONTENT_TYPES = {
     "application/octet-stream",
 }
 
+logger = logging.getLogger(__name__)
+
 
 class CameraUploadError(ValueError):
     pass
@@ -26,6 +30,15 @@ def normalize_content_type(content_type: str | None) -> str:
 def safe_path_part(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
     return cleaned[:80] or "default"
+
+
+def get_max_saved_images_per_device() -> int:
+    raw_value = os.getenv("MAX_SAVED_IMAGES_PER_DEVICE", "10").strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return 10
+    return max(value, 1)
 
 
 def validate_jpeg_upload(image_bytes: bytes, content_type: str | None) -> str:
@@ -59,6 +72,7 @@ def save_camera_image(
     filename = f"{image_id}.jpg"
     path = device_dir / filename
     path.write_bytes(image_bytes)
+    cleanup_old_camera_images(device_dir, get_max_saved_images_per_device())
 
     return {
         "image_id": image_id,
@@ -67,6 +81,32 @@ def save_camera_image(
         "size_bytes": len(image_bytes),
         "content_type": normalized_content_type,
     }
+
+
+def cleanup_old_camera_images(device_dir: Path, max_images: int) -> int:
+    image_paths = sorted(
+        (path for path in device_dir.glob("*.jpg") if path.is_file()),
+        key=lambda path: (path.stat().st_mtime, path.name),
+        reverse=True,
+    )
+    stale_paths = image_paths[max_images:]
+    removed = 0
+
+    for path in stale_paths:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as exc:
+            logger.warning("camera.cleanup.failed path=%s error=%s", path, exc)
+
+    if removed:
+        logger.info(
+            "camera.cleanup.done device_dir=%s kept=%d removed=%d",
+            device_dir,
+            max_images,
+            removed,
+        )
+    return removed
 
 
 def clean_optional_text(value: str | None) -> str | None:
