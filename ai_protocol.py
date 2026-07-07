@@ -10,6 +10,7 @@ from uuid import uuid4
 from asr import AsrCancelled, AsrConfigError, AsrError, transcribe_device_wav
 from pipeline import generate_answer_text
 from sessions import normalize_device_id
+from text_normalize import normalize_artifact_mentions
 from tts import synthesize_to_device_wav
 from wav_utils import WavFormatError, looks_like_silence, validate_device_wav
 
@@ -349,7 +350,15 @@ async def run_asr_stage(session: AiSession) -> None:
         )
         return
 
-    session.asr_text = asr_result.text.strip()
+    raw_asr_text = asr_result.text.strip()
+    session.asr_text = normalize_artifact_mentions(raw_asr_text)
+    if session.asr_text != raw_asr_text:
+        logger.info(
+            "ai.asr.normalized session=%s raw=%s normalized=%s",
+            session.session_id,
+            raw_asr_text,
+            session.asr_text,
+        )
     if not session.asr_text:
         session.answer_text = os.getenv("AI_NO_SPEECH_TEXT", "我没有听清，请再说一遍。")
         session.tts_status = "skipped"

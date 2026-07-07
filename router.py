@@ -7,6 +7,7 @@ from artifacts import ArtifactNotFoundError, find_artifacts_by_text, get_artifac
 from llm import stream_chat_completion
 from output_format import format_for_device_display
 from sessions import DeviceSession, get_session, remember_turn
+from text_normalize import normalize_artifact_mentions
 from tools import get_device_status
 
 
@@ -167,6 +168,8 @@ def elapsed_ms(start: float) -> float:
 async def chat_stream(user_message: str, device_id: str) -> AsyncIterator[str]:
     total_start = perf_counter()
     session = get_session(device_id)
+    original_message = user_message
+    user_message = normalize_artifact_mentions(user_message)
     chunks: list[str] = []
     direct_response = direct_response_for(user_message, session)
     logger.info(
@@ -176,6 +179,13 @@ async def chat_stream(user_message: str, device_id: str) -> AsyncIterator[str]:
         len(session.memory),
         session.latest_artifact_id,
     )
+    if user_message != original_message:
+        logger.info(
+            "chat.normalized device=%s original=%s normalized=%s",
+            device_id,
+            original_message,
+            user_message,
+        )
 
     if direct_response is not None:
         assistant_message = format_for_device_display(direct_response)
@@ -246,6 +256,16 @@ async def chat_response(
 ) -> str:
     total_start = perf_counter()
     session = get_session(device_id)
+    original_message = user_message
+    user_message = normalize_artifact_mentions(user_message)
+    if user_message != original_message:
+        logger.info(
+            "chat_once.normalized device=%s original=%s normalized=%s",
+            device_id,
+            original_message,
+            user_message,
+        )
+
     direct_response = direct_response_for(user_message, session)
     if direct_response is not None:
         assistant_message = format_for_device_display(direct_response)

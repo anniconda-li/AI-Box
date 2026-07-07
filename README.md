@@ -34,6 +34,7 @@
 ├── wav_utils.py      # 设备 WAV 格式校验和测试 WAV 生成
 ├── router.py         # 组装上下文、memory、tool 判断、流式转发
 ├── output_format.py  # 清理 Markdown，生成设备端可直接显示的纯文本
+├── text_normalize.py # ASR 文本拼音近似纠错，修正文物名同音错字
 ├── sessions.py       # 按 device_id 管理设备会话和 memory
 ├── artifacts.py      # 加载本地文物知识卡
 ├── vision.py         # 保存相机图片、模拟视觉识别结果
@@ -122,6 +123,7 @@
 - `wav_utils.py` 负责校验设备要求的 WAV 格式。
 - `router.py` 负责业务编排。
 - `output_format.py` 负责把模型回复规整成设备端可直接显示和朗读的纯文本。
+- `text_normalize.py` 负责在文本进入 LLM 前修正文物名同音错字。
 - `sessions.py` 负责设备上下文、当前文物和短期记忆。
 - `artifacts.py` 负责加载和查询本地文物知识卡。
 - `vision.py` 负责图片保存和人工模拟识别结果。
@@ -193,6 +195,7 @@ ASR_MODEL=paraformer-realtime-v2
 # ASR_API_KEY 默认复用 DASHSCOPE_API_KEY
 ASR_FRAME_BYTES=3200
 ASR_FRAME_SLEEP_SECONDS=0
+ASR_ARTIFACT_PHONETIC_THRESHOLD=0.86
 
 TTS_PROVIDER=dashscope
 TTS_API_STYLE=dashscope_qwen
@@ -775,6 +778,7 @@ POST /ai/finish?session=abc123&device=walkie-02
 - 如果 WAV 无效，返回 `failed`。
 - 如果 WAV 太短或接近静音，返回 `no_speech`，`answer_text` 默认为“我没有听清，请再说一遍。”。
 - 有效语音会调用 `asr.py` 中的 DashScope Paraformer 识别，识别文本写入 `asr_text`。
+- ASR 文本进入 LLM 前会经过 `text_normalize.py` 的文物名拼音近似纠错，例如“英国玉婴”“应国玉英”会修正为“应国玉鹰”，再进行本地知识卡匹配。
 - 如果 ASR 配置错误或服务调用失败，返回 `failed`，并通过 `answer_text` 给设备一段可显示的错误提示，避免设备一直轮询。
 - 如果配置了 `AI_MOCK_ASR_TEXT`，后端会跳过真实 ASR，用这段文本调用现有 LLM 编排。
 - LLM 生成 `answer_text` 后，后端会异步调用 TTS，并把结果统一保存为 16k/16-bit/mono PCM WAV。
