@@ -326,6 +326,13 @@ Compose 保持现有 `8000` 端口和 `.env` 配置方式。详细说明见 [`do
 
 供 `wkt-deploy` 使用的固定契约摘要：镜像 `wkt-ai-server`、容器 `wkt-ai-server`、Compose 服务 `ai`、容器端口 `8000`、健康检查 `GET /health`、持久化目录 `/app/uploads` 和 `/app/outputs`。全部路由、环境变量、请求体限制、超时和单实例状态约束以 [`docs/deployment.md`](docs/deployment.md) 为准。
 
+### GHCR 正式镜像发布
+
+- 普通 push 和 pull request 只运行测试，不发布正式镜像。
+- 推送严格符合 `vX.Y.Z` 的 Git 标签时发布 GHCR 镜像；例如 Git 标签 `v0.1.0` 对应镜像标签 `0.1.0`。
+- 每次发布同时生成 `sha-*` 镜像标签。
+- 正式镜像地址为 `ghcr.io/anniconda-li/wkt-ai-server:<version>`；部署时禁止使用 `latest`。
+
 ## 耗时日志
 
 测试性能时，把启动后端的 PowerShell 窗口留着看日志。`LOG_LEVEL=INFO` 时，会输出每个关键阶段的耗时，单位是毫秒。
