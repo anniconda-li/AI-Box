@@ -53,9 +53,13 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logging.getLogger().setLevel(get_log_level())
-logger = logging.getLogger("ai_box.main")
+logger = logging.getLogger("wkt_ai_server.main")
 
-app = FastAPI(title="Minimal AI Chat Backend")
+app = FastAPI(
+    title="wkt-ai-server",
+    description="Walkie-talkie AI voice, ASR, TTS, WAV chunking, and camera analysis service.",
+    version="0.1.0",
+)
 
 
 def elapsed_ms(start: float) -> float:

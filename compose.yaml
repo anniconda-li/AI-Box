@@ -1,0 +1,16 @@
+name: wkt-ai-server
+
+services:
+  ai:
+    image: wkt-ai-server:local
+    container_name: wkt-ai-server
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs

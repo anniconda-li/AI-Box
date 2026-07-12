@@ -1,6 +1,16 @@
-# Minimal AI Chat Backend
+# wkt-ai-server
 
-一个最小可运行的 AI 聊天后端示例，使用 Python 3.11、FastAPI 和 OpenAI-compatible API。
+对讲设备平台的独立 AI 后端，使用 Python 3.11、FastAPI 和 OpenAI-compatible API。
+
+## 项目身份与边界
+
+- 项目名、本地目录名、GitHub 仓库名和 Docker 镜像名统一为 `wkt-ai-server`。
+- Compose 服务名固定为 `ai`，容器名为 `wkt-ai-server`。
+- 本仓库只负责现有 AI 语音、ASR、TTS、WAV 分片和相机分析能力。
+- 本仓库保持独立 Git 仓库、独立 GitHub 仓库、独立 Docker 镜像和独立容器，不与对讲服务或 OTA 服务合并。
+- 本地父目录 `wkt-platform` 只用于归档三个独立后端目录，不初始化 Git，也不是 monorepo。
+- ESP-IDF 固件项目 `walkie-talkiev1` 位于 `wkt-platform` 之外，完全独立于本服务。
+- 本次名称规范化不改变现有 API 路径、端口、协议或请求响应格式。
 
 当前版本已经支持：
 
@@ -50,6 +60,10 @@
 ├── local_text_ask_cli.py # 本地文本问答 + TTS 测试客户端
 ├── ai_wav_cli.py     # 模拟 ESP32 /ai 协议上传 WAV 并拉取回复
 ├── requirements.txt  # Python 依赖
+├── pyproject.toml    # wkt-ai-server 项目元数据
+├── Dockerfile       # 独立镜像构建配置
+├── compose.yaml     # 本地 Compose 配置，服务名 ai
+├── tests/           # 不访问外部模型服务的冒烟测试
 ├── .env.example      # 环境变量示例，不放真实 key
 └── .gitignore        # 忽略 .env、.venv、缓存文件
 ```
@@ -139,7 +153,7 @@
 本机推荐使用 `uv` 创建虚拟环境：
 
 ```powershell
-cd D:\develop\Projects\AI-Box
+cd C:\path\to\wkt-ai-server
 uv venv --python 3.11 .venv
 .\.venv\Scripts\Activate.ps1
 uv pip install -r requirements.txt
@@ -267,7 +281,7 @@ OPENAI_MODEL=gpt-4o-mini
 ## 启动后端
 
 ```powershell
-cd D:\develop\Projects\AI-Box
+cd C:\path\to\wkt-ai-server
 .\.venv\Scripts\python.exe -m uvicorn main:app --reload --env-file .env
 ```
 
@@ -289,6 +303,17 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 {"status":"ok"}
 ```
 
+## Docker / Compose 本地验证
+
+镜像名、服务名和容器名已经固定，下面的命令只用于本地或测试环境，不会部署生产环境：
+
+```powershell
+docker build -t wkt-ai-server:local .
+docker compose up --build ai
+```
+
+Compose 保持现有 `8000` 端口和 `.env` 配置方式。详细说明见 [`docs/deployment.md`](docs/deployment.md)。
+
 ## 耗时日志
 
 测试性能时，把启动后端的 PowerShell 窗口留着看日志。`LOG_LEVEL=INFO` 时，会输出每个关键阶段的耗时，单位是毫秒。
@@ -296,12 +321,12 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 图片上传链路会看到类似日志：
 
 ```text
-2026-07-05 18:20:01 INFO [ai_box.main] camera.upload.start device=walkie-01 manual_artifact=False use_vision=True content_type=image/jpeg
-2026-07-05 18:20:01 INFO [ai_box.main] camera.upload.stage read_body_ms=1.2 bytes=14088
-2026-07-05 18:20:01 INFO [ai_box.main] camera.upload.stage save_image_ms=3.4 image_id=... size_bytes=14088
+2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.start device=walkie-01 manual_artifact=False use_vision=True content_type=image/jpeg
+2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.stage read_body_ms=1.2 bytes=14088
+2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.stage save_image_ms=3.4 image_id=... size_bytes=14088
 2026-07-05 18:20:03 INFO [vision_llm] vision.recognition.stage api_call_ms=1820.5
-2026-07-05 18:20:03 INFO [ai_box.main] camera.upload.stage recognition_ms=1845.7 mode=vision_llm predicted_artifact_id=yingguo_jade_eagle accepted=True confidence=0.86
-2026-07-05 18:20:03 INFO [ai_box.main] camera.upload.done device=walkie-01 image_id=... latest_artifact_id=yingguo_jade_eagle total_ms=1860.2
+2026-07-05 18:20:03 INFO [wkt_ai_server.main] camera.upload.stage recognition_ms=1845.7 mode=vision_llm predicted_artifact_id=yingguo_jade_eagle accepted=True confidence=0.86
+2026-07-05 18:20:03 INFO [wkt_ai_server.main] camera.upload.done device=walkie-01 image_id=... latest_artifact_id=yingguo_jade_eagle total_ms=1860.2
 ```
 
 聊天链路会看到：
@@ -324,7 +349,7 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 Windows PowerShell 手写 JSON 很容易遇到中文编码和引号转义问题，所以推荐使用内置终端客户端：
 
 ```powershell
-cd D:\develop\Projects\AI-Box
+cd C:\path\to\wkt-ai-server
 .\.venv\Scripts\python.exe chat_cli.py
 ```
 
@@ -678,7 +703,7 @@ Invoke-RestMethod `
   "image": {
     "image_id": "20260705T120000000000Z_abcd1234",
     "filename": "20260705T120000000000Z_abcd1234.jpg",
-    "path": "D:\\develop\\Projects\\AI-Box\\uploads\\walkie-01\\20260705T120000000000Z_abcd1234.jpg",
+    "path": "C:\\path\\to\\wkt-ai-server\\uploads\\walkie-01\\20260705T120000000000Z_abcd1234.jpg",
     "size_bytes": 123456,
     "content_type": "image/jpeg"
   },
@@ -1190,7 +1215,7 @@ $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
 
 说明后端收到了请求，但连接模型 API 超时。检查：
 
-- `.env` 是否在项目目录 `D:\develop\Projects\AI-Box`
+- `.env` 是否在项目目录 `C:\path\to\wkt-ai-server`
 - `OPENAI_API_KEY` 是否是真实 key
 - `OPENAI_BASE_URL` 是否正确
 - 当前网络是否能访问模型服务商
