@@ -62,11 +62,11 @@ docker compose config
 
 | 容器路径 | 用途 | 部署要求 |
 | --- | --- | --- |
-| `/app/uploads` | 相机 JPEG、设备上传 WAV、处理后的回复 WAV | 必须持久化；生产环境使用命名卷或宿主机受控目录 |
+| `/app/uploads` | 相机 JPEG、JPEG 分片、相机 SQLite、WAI1 SQLite/临时文件、设备上传 WAV、处理后的 WAV/ROP1 | 必须持久化；生产环境使用命名卷或宿主机受控目录 |
 | `/app/outputs` | 本地文本/TTS 客户端生成的回复文件 | 建议持久化；不用仓库内临时目录承载生产数据 |
 | `/app/data/artifacts` | 随镜像发布的只读文物知识卡 | 不挂载运行时空目录覆盖 |
 
-设备会话、聊天记忆和 `/ai` 处理状态当前保存在进程内存中。部署必须保持单进程、单副本；在没有外部状态存储和共享文件系统前，不要增加 Uvicorn worker，也不要对多个副本做无粘性的负载均衡。容器重启会清空内存会话，客户端需要重新开始会话。
+相机 `X-Request-ID` 幂等状态和 JPEG 分片元数据保存在 `/app/uploads/camera_idempotency.sqlite3`。WAI1 会话和分片索引保存在 `/app/uploads/ai_ws.sqlite3`，字节位于 `/app/uploads/ai_ws`，可跨 WebSocket 断线恢复。SQLite 事务可协调共享文件系统上的 finish claim，但活跃连接替换、主动推送、聊天记忆和现有 AI runtime task 仍是进程内状态，所以整体部署必须保持单进程、单副本；不要因为上传状态使用 SQLite 就增加 worker 数。进程重启后已落盘上传仍可查询和清理，但已发出的模型任务不会自动跨进程恢复。
 
 ## HTTP 路由
 
@@ -82,14 +82,18 @@ docker compose config
 | `POST` | `/sessions/{device_id}/artifact-context` | JSON：`artifact_id`、可选 `vision_description`、`image_id` |
 | `GET` | `/artifacts` | 文物知识卡摘要列表 |
 | `GET` | `/artifacts/{artifact_id}` | 文物知识卡详情 |
-| `POST` | `/camera/upload` | raw JPEG body；query：`device`、可选 `artifact_id`、`vision_description`、`use_vision` |
-| `POST` | `/ai/start` | JSON：`device`、`language`；返回 session 和 `chunk_size=8192` |
-| `POST` | `/ai/upload` | raw WAV chunk；query：`session`、`index`、`offset`、`total`、可选 `device` |
+| `POST` | `/camera/upload` | raw JPEG body；必须有 `Content-Length`；可选成对发送 `X-Request-ID`、`X-Content-SHA256`；query：`device`、可选 `artifact_id`、`vision_description`、`use_vision` |
+| `POST` | `/camera/upload/chunk` | 最大 4096 字节 raw chunk；query：`device`、`request_id`、`offset`、`total`；完整图和分片 SHA 请求头必填 |
+| `POST` | `/camera/upload/finish` | 空 body；query：`device`、`request_id`；同步校验、识别并返回最终业务结果 |
+| `POST` | `/camera/upload/cancel` | 空 body；query：`device`、`request_id`；幂等取消未开始识别的上传 |
+| `POST` | `/ai/start` | JSON：`device`、`language`、可选 `audio_format`；返回 session、确认格式和 `chunk_size=32768` |
+| `POST` | `/ai/upload` | raw WAV 或 AOP1 chunk；query：`session`、`index`、`offset`、`total`、可选 `device` |
 | `POST` | `/ai/finish` | query：`session`、可选 `device`；后台启动 ASR/LLM/TTS |
 | `POST` | `/ai/result_info` | query：`session`、可选 `device`；轮询处理状态 |
 | `POST` | `/ai/result_chunk` | query：`session`、`offset`、`len`、可选 `device`；返回 `audio/wav` |
 | `POST` | `/ai/cancel` | query：`session`、可选 `device` |
 | `POST` | `/ai/stop_audio` | query：`session`、可选 `device` |
+| `WS` | `/ai/ws?device=...&protocol=wai1` | 独立 AI WebSocket；AOP1/JPEG 上传、状态推送、ROP1 下载与断线续传 |
 
 请求参数、状态码和响应字段的完整示例见仓库根目录 `README.md`。部署层不得重写这些路径或改变请求体编码。
 
@@ -105,16 +109,33 @@ docker compose config
 | 文本 LLM | `OPENAI_BASE_URL` | OpenAI-compatible endpoint，可选 |
 | 百炼共享 | `DASHSCOPE_API_KEY` | 视觉、ASR、TTS 使用百炼时必填，可被各模块 key 覆盖 |
 | 百炼共享 | `DASHSCOPE_BASE_URL` | OpenAI-compatible 百炼 endpoint，可选 |
-| 视觉 | `VISION_PROVIDER`, `VISION_MODEL` | `dashscope`, `qwen-vl-plus` |
+| 视觉 | `VISION_PROVIDER`, `VISION_MODEL` | `dashscope`, `qwen3.6-flash-2026-04-16` |
 | 视觉 | `VISION_API_KEY`, `VISION_BASE_URL` | 可选；默认复用百炼配置 |
+| 视觉 | `VISION_ENABLE_THINKING` | `false`，降低延迟并稳定 JSON 输出 |
 | 视觉 | `VISION_MIN_CONFIDENCE` | `0.60` |
+| 视觉 | `VISION_TIMEOUT_SECONDS` | `120`；小于 120 的配置会提升到 120 秒 |
 | 图片保存 | `MAX_SAVED_IMAGES_PER_DEVICE` | `10`，最小按 1 处理 |
-| ASR | `ASR_PROVIDER`, `ASR_MODEL` | `dashscope`, `paraformer-realtime-v2` |
+| 图片上传 | `CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS` | `8`，连续无新字节时返回 HTTP 408 |
+| 图片幂等 | `CAMERA_IDEMPOTENCY_DB_PATH` | 默认 `/app/uploads/camera_idempotency.sqlite3` |
+| 图片幂等 | `CAMERA_IDEMPOTENCY_TTL_SECONDS`, `CAMERA_IDEMPOTENCY_MAX_RECORDS` | `1200`, `1000` |
+| 图片幂等 | `CAMERA_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS`, `CAMERA_IDEMPOTENCY_POLL_INTERVAL_SECONDS` | `180`, `0.1` |
+| 图片分片 | `CAMERA_CHUNK_TEMP_DIR` | 默认 `/app/uploads/camera_chunks` |
+| 图片分片 | `CAMERA_CHUNK_SESSION_TTL_SECONDS`, `CAMERA_CHUNK_COMPLETED_TTL_SECONDS` | `600`, `1200` |
+| 图片分片 | `CAMERA_CHUNK_MAX_SESSIONS`, `CAMERA_CHUNK_MAX_TEMP_BYTES` | `100`, `67108864`（64 MiB） |
+| 图片分片 | `CAMERA_CHUNK_CLEANUP_INTERVAL_SECONDS` | `60` 秒 |
+| AI WebSocket | `AI_WS_DB_PATH`, `AI_WS_TEMP_DIR` | 默认 `/app/uploads/ai_ws.sqlite3`, `/app/uploads/ai_ws` |
+| AI WebSocket | `AI_WS_SESSION_TTL_SECONDS` | `1200`，代码强制最小 600 秒 |
+| AI WebSocket | `AI_WS_MAX_SESSIONS`, `AI_WS_MAX_SESSIONS_PER_DEVICE` | `200`, `4` |
+| AI WebSocket | `AI_WS_MAX_TEMP_BYTES`, `AI_WS_CLEANUP_INTERVAL_SECONDS` | `67108864`, `60` |
+| AI WebSocket | `AI_WS_SEND_QUEUE_SIZE` | `32` 条，满时关闭慢连接 |
+| ASR | `ASR_PROVIDER`, `ASR_MODEL` | `dashscope`, `qwen3-asr-flash-2026-02-10` |
+| ASR | `ASR_FALLBACK_MODEL` | `paraformer-realtime-v2`；留空禁用回退 |
 | ASR | `ASR_API_KEY` | 可选；默认复用 `DASHSCOPE_API_KEY` |
+| ASR | `ASR_LANGUAGE`, `ASR_ENABLE_ITN`, `ASR_TIMEOUT_SECONDS` | `zh`, `false`, `60` |
 | ASR | `ASR_FRAME_BYTES`, `ASR_FRAME_SLEEP_SECONDS` | `3200`, `0` |
 | ASR | `ASR_EXTRA_KWARGS` | 可选 JSON 对象 |
 | ASR 纠错 | `ASR_ARTIFACT_PHONETIC_THRESHOLD` | `0.86` |
-| TTS | `TTS_PROVIDER`, `TTS_API_STYLE`, `TTS_MODEL` | `dashscope`, 自动推断/示例为 `dashscope_qwen`, `qwen3-tts-flash` |
+| TTS | `TTS_PROVIDER`, `TTS_API_STYLE`, `TTS_MODEL` | `dashscope`, 自动推断/示例为 `dashscope_qwen`, `qwen3-tts-flash-2025-11-27` |
 | TTS | `TTS_API_KEY` | 可选；依次复用 `DASHSCOPE_API_KEY`、`OPENAI_API_KEY` |
 | TTS | `TTS_BASE_URL`, `DASHSCOPE_TTS_BASE_URL`, `TTS_ENDPOINT` | 可选 endpoint 覆盖项 |
 | TTS | `TTS_VOICE`, `TTS_LANGUAGE_TYPE`, `TTS_RESPONSE_FORMAT` | `Cherry`, `Chinese`, `wav` |
@@ -130,15 +151,71 @@ docker compose config
 
 | 链路 | 应用限制 | 部署层要求 |
 | --- | --- | --- |
-| `/camera/upload` | JPEG 最小 128 字节，最大 8 MiB | 反向代理请求体上限至少 8 MiB；建议配置 9 MiB 预留开销 |
-| `/ai/upload` | 单个会话声明的 WAV 总大小最大 2,100,000 字节；服务端建议分片 8,192 字节 | 不合并或改写 query 参数和 raw body |
+| `/camera/upload` | JPEG 最小 128 字节，最大 8 MiB；必须校验 `Content-Length`；默认连续 8 秒无新字节才算上传空闲超时，没有固定总接收时长 | 反向代理请求体上限建议 9 MiB；请求体空闲超时约 15 秒；关闭请求缓冲，让应用立即消费 body |
+| `/camera/upload/chunk` | 每片最多 4096 字节，非末片必须正好 4096 字节；完整图仍最大 8 MiB | 请求体上限建议 5 KiB；不要缓存或改写 raw body |
+| `/camera/upload/finish` | 空 body；同步等待视觉模型并返回最终 JSON | 响应读取超时建议 300 秒 |
+| `/ai/upload` | PCM WAV 最大 2,100,000 字节；AOP1 Opus 最大 262,144 字节；建议分片 32,768 字节 | 允许 `application/octet-stream` 和 `application/vnd.wkt.opus-packets`，不改写 query 或 raw body |
 | `/ai/result_chunk` | 单次最多返回 32,768 字节 | 允许 `audio/wav` 二进制响应 |
+| `/ai/ws` | WAI1 payload 最大 4096；30 秒无有效消息关闭；ROP1 最大 384 KiB | 必须转发 Upgrade；读写空闲超时建议 45 秒；关闭响应缓冲 |
 | TTS 回复 WAV | 最大 4,000,000 字节 | `/app/uploads` 需要足够磁盘空间 |
 | `/chat` | 流式纯文本响应 | 禁用代理响应缓冲，空闲/读取超时至少 120 秒 |
 | `/camera/upload` 视觉识别 | 请求会等待外部视觉模型返回 | 上游超时至少 120 秒；网络较慢时建议 300 秒 |
 | `/ai/finish` 后台处理 | 接口很快返回，客户端轮询 `/ai/result_info`；示例客户端总等待 300 秒 | 不要把长处理误判为 `/ai/finish` HTTP 超时 |
 
-应用内显式的外部请求超时只有 `TTS_TIMEOUT_SECONDS=120`。文本 LLM、视觉和 ASR 还会受各 SDK、网络及模型服务端超时影响；生产代理应保留不低于上表的预算。
+应用为视觉请求显式保留至少 `VISION_TIMEOUT_SECONDS=120`，TTS 默认 `TTS_TIMEOUT_SECONDS=120`。文本 LLM 和 ASR 还会受各 SDK、网络及模型服务端超时影响；生产代理应保留不低于上表的预算。
+
+当前仓库的 Dockerfile 和 Compose 都直接启动一个 Uvicorn worker，未配置 Nginx 或 Traefik；正式部署仓库当前也是直接把宿主端口映射到容器端口。以后若在前面加入 Nginx，`/camera/upload` 建议单独配置：
+
+```nginx
+location = /camera/upload {
+    client_max_body_size 9m;
+    client_body_timeout 15s;
+    proxy_request_buffering off;
+    proxy_http_version 1.1;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 15s;
+    send_timeout 300s;
+    proxy_pass http://wkt_ai_server;
+}
+
+location = /camera/upload/chunk {
+    client_max_body_size 5k;
+    client_body_timeout 15s;
+    proxy_request_buffering off;
+    proxy_http_version 1.1;
+    proxy_send_timeout 15s;
+    proxy_read_timeout 30s;
+    proxy_pass http://wkt_ai_server;
+}
+
+location = /camera/upload/finish {
+    client_max_body_size 1k;
+    proxy_http_version 1.1;
+    proxy_read_timeout 300s;
+    send_timeout 300s;
+    proxy_pass http://wkt_ai_server;
+}
+
+location = /camera/upload/cancel {
+    client_max_body_size 1k;
+    proxy_http_version 1.1;
+    proxy_read_timeout 30s;
+    proxy_pass http://wkt_ai_server;
+}
+
+location = /ai/ws {
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_buffering off;
+    proxy_read_timeout 45s;
+    proxy_send_timeout 45s;
+    proxy_pass http://wkt_ai_server;
+}
+```
+
+`client_body_timeout` 是客户端相邻两次发送之间的空闲超时，`proxy_send_timeout` 限制 Nginx 向应用写请求体时的连续无进展时间，两者都不是整个 JPEG 上传的固定总时长。`proxy_read_timeout` 则覆盖完整上传后的视觉识别等待。不要用视觉阶段的 300 秒去替代请求体空闲超时，也不要让代理先缓冲完整 body 后才转发给应用。
 
 ## Git 与秘密边界
 

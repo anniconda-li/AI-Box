@@ -13,7 +13,7 @@ from vision import normalize_content_type
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_VISION_PROVIDER = "dashscope"
-DEFAULT_VISION_MODEL = "qwen-vl-plus"
+DEFAULT_VISION_MODEL = "qwen3.6-flash-2026-04-16"
 UNKNOWN_ARTIFACT_ID = "unknown"
 
 _vision_client: AsyncOpenAI | None = None
@@ -59,6 +59,20 @@ def get_min_confidence() -> float:
     return min(max(value, 0.0), 1.0)
 
 
+def get_vision_timeout_seconds() -> float:
+    raw_value = os.getenv("VISION_TIMEOUT_SECONDS", "120").strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return 120.0
+    return max(value, 120.0)
+
+
+def is_thinking_enabled() -> bool:
+    value = os.getenv("VISION_ENABLE_THINKING", "false")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def is_vision_configured() -> bool:
     return bool(get_vision_provider() and get_vision_model() and get_vision_api_key())
 
@@ -80,6 +94,7 @@ def get_vision_client() -> AsyncOpenAI:
         _vision_client = AsyncOpenAI(
             api_key=get_vision_api_key(),
             base_url=get_vision_base_url(),
+            timeout=get_vision_timeout_seconds(),
         )
     return _vision_client
 
@@ -256,6 +271,8 @@ async def recognize_artifact_from_image(
                 }
             ],
             temperature=0,
+            response_format={"type": "json_object"},
+            extra_body={"enable_thinking": is_thinking_enabled()},
         )
     except Exception as exc:
         raise VisionRecognitionError(

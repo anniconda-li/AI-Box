@@ -26,6 +26,8 @@
 
 - `/chat` 聊天接口
 - `/camera/upload` JPEG 图片上传接口
+- `/camera/upload/chunk` + `/finish` JPEG 弱网分片上传接口
+- `/ai/ws?device=...&protocol=wai1` 独立 AI WebSocket（语音、相机、状态推送和 ROP1 回复）
 - `/ai/*` ESP32 语音分片上传、ASR、轮询结果、按需拉取 WAV 协议
 - 本地文本 -> LLM -> TTS -> ESP32 WAV 测试链路
 - 模型 streaming 输出
@@ -48,6 +50,10 @@
 .
 ├── main.py           # FastAPI app，定义 HTTP 接口
 ├── ai_protocol.py    # ESP32 /ai 语音协议、session、分片、取消状态
+├── ai_ws.py          # 独立 WAI1 WebSocket 生命周期、状态推送和后台任务
+├── ai_ws_store.py    # WAI1 SQLite 会话、分片索引和 TTL 清理
+├── wai1_protocol.py  # WAI1 32 字节二进制头编解码与 CRC32 校验
+├── rop1.py           # 回复 Opus 的 ROP1 容器编码、解析和 Ogg 回放
 ├── asr.py            # 调用 DashScope Paraformer，把设备 WAV 转成文字
 ├── pipeline.py       # 本地文本 -> LLM -> TTS -> 设备 WAV 流水线
 ├── tts.py            # 调用 TTS 并统一输出 ESP32 标准 WAV
@@ -59,6 +65,8 @@
 ├── artifacts.py      # 加载本地文物知识卡
 ├── vision.py         # 保存相机图片、模拟视觉识别结果
 ├── vision_llm.py     # 调用 DashScope Qwen-VL 做候选约束识别
+├── camera_idempotency.py # 相机识别结果的 SQLite 幂等状态
+├── camera_chunk_upload.py # JPEG 分片会话、临时文件和清理策略
 ├── llm.py            # 封装 OpenAI-compatible streaming 调用
 ├── tools.py          # 示例 tool：get_device_status()
 ├── data/artifacts/   # 5 件核心文物的本地 JSON 知识卡
@@ -77,6 +85,9 @@
 ├── .env.example      # 环境变量示例，不放真实 key
 └── .gitignore        # 忽略 .env、.venv、缓存文件
 ```
+
+WAI1 的完整 JSON、二进制头、ROP1、状态机、持久化限制和 Nginx 示例见
+[`docs/ai-websocket.md`](docs/ai-websocket.md)。旧 HTTP AI 和相机接口继续兼容。
 
 ## 实现流程
 
@@ -115,10 +126,11 @@
 一次 ESP32 语音请求的协议流程：
 
 ```text
-设备 POST /ai/start，提交 device 和 language
+设备 POST /ai/start，提交 device、language 和可选 audio_format
   -> ai_protocol.py 创建语音 session，返回 session 和 chunk_size
-设备 POST /ai/upload 分片上传 WAV
-  -> ai_protocol.py 按 session + offset 写入 uploads/ai/{device}/{session}/request.wav
+设备 POST /ai/upload 分片上传 PCM WAV 或 AOP1 裸 Opus 帧
+  -> ai_protocol.py 按 session + offset 组装请求音频
+  -> AOP1 在服务端校验并封装成标准 Ogg/Opus，同时解码 WAV 供静音判断和 ASR 回退
 设备 POST /ai/finish
   -> 后端立即返回当前状态，并在后台处理 ASR / LLM / TTS
 设备 POST /ai/result_info 每秒轮询
@@ -141,7 +153,8 @@
 
 - `main.py` 负责 HTTP 接口。
 - `ai_protocol.py` 负责 ESP32 语音协议状态机。
-- `asr.py` 负责调用 DashScope Paraformer，把设备上传的 WAV 转成文字。
+- `asr.py` 负责调用 DashScope Qwen3-ASR，并在需要时回退到 Paraformer。
+- `opus_packets.py` 负责校验设备 AOP1 裸 Opus 帧并封装成标准 Ogg/Opus。
 - `pipeline.py` 负责本地文本到回答和 TTS WAV 的完整流水线。
 - `tts.py` 负责调用 TTS，并把返回音频统一成设备要求的 WAV。
 - `wav_utils.py` 负责校验设备要求的 WAV 格式。
@@ -199,9 +212,16 @@ DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 
 ```env
 VISION_PROVIDER=dashscope
-VISION_MODEL=qwen-vl-plus
+VISION_MODEL=qwen3.6-flash-2026-04-16
+VISION_ENABLE_THINKING=false
 VISION_MIN_CONFIDENCE=0.60
+VISION_TIMEOUT_SECONDS=120
 MAX_SAVED_IMAGES_PER_DEVICE=10
+CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS=8
+CAMERA_IDEMPOTENCY_TTL_SECONDS=1200
+CAMERA_IDEMPOTENCY_MAX_RECORDS=1000
+CAMERA_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS=180
+CAMERA_IDEMPOTENCY_POLL_INTERVAL_SECONDS=0.1
 ```
 
 一般不需要单独写 `VISION_API_KEY` 或 `VISION_BASE_URL`，它们会默认复用 `DASHSCOPE_API_KEY` 和 `DASHSCOPE_BASE_URL`。只有当视觉模型想换到另一个服务商或另一个百炼 endpoint 时，才需要覆盖：
@@ -215,7 +235,11 @@ MAX_SAVED_IMAGES_PER_DEVICE=10
 
 ```env
 ASR_PROVIDER=dashscope
-ASR_MODEL=paraformer-realtime-v2
+ASR_MODEL=qwen3-asr-flash-2026-02-10
+ASR_FALLBACK_MODEL=paraformer-realtime-v2
+ASR_LANGUAGE=zh
+ASR_ENABLE_ITN=false
+ASR_TIMEOUT_SECONDS=60
 # ASR_API_KEY 默认复用 DASHSCOPE_API_KEY
 ASR_FRAME_BYTES=3200
 ASR_FRAME_SLEEP_SECONDS=0
@@ -223,11 +247,13 @@ ASR_ARTIFACT_PHONETIC_THRESHOLD=0.86
 
 TTS_PROVIDER=dashscope
 TTS_API_STYLE=dashscope_qwen
-TTS_MODEL=qwen3-tts-flash
+TTS_MODEL=qwen3-tts-flash-2025-11-27
 TTS_VOICE=Cherry
 TTS_LANGUAGE_TYPE=Chinese
 TTS_TIMEOUT_SECONDS=120
 ```
+
+当前设备在 `/ai/finish` 后处理完整请求音频（PCM WAV 或 AOP1/Opus），因此主 ASR 使用同步短音频模型。主模型请求失败时会自动回退到 `ASR_FALLBACK_MODEL`；将该变量留空可以关闭回退。Qwen3-ASR 单文件限制为 5 分钟、10 MB，超过设备协议约束的音频会在调用前失败。
 
 `TTS_API_KEY` 默认复用 `DASHSCOPE_API_KEY`。Qwen3-TTS 默认请求百炼公共 API：
 
@@ -253,9 +279,10 @@ FFMPEG_BIN=D:\tools\ffmpeg\bin\ffmpeg.exe
 
 ```text
 DeepSeek / OPENAI_MODEL      -> 文本讲解和问答
-Qwen-VL / VISION_MODEL       -> 图片识别，输出 artifact_id
-Paraformer / ASR_MODEL       -> 语音转文字
-Qwen3-TTS / TTS_MODEL        -> 文字转语音，输出 ESP32 标准 WAV
+Qwen3-VL / VISION_MODEL            -> 图片识别，输出 artifact_id
+Qwen3-ASR / ASR_MODEL              -> 完整音频语音转文字
+Paraformer / ASR_FALLBACK_MODEL    -> 主 ASR 失败时回退
+Qwen3-TTS / TTS_MODEL              -> 文字转语音，输出 ESP32 标准 WAV
 ```
 
 OpenAI 官方示例：
@@ -340,7 +367,8 @@ Compose 保持现有 `8000` 端口和 `.env` 配置方式。详细说明见 [`do
 图片上传链路会看到类似日志：
 
 ```text
-2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.start device=walkie-01 manual_artifact=False use_vision=True content_type=image/jpeg
+2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.start device=walkie-01 manual_artifact=False use_vision=True content_type=image/jpeg content_length=14088
+2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.receive device=walkie-01 chunk_bytes=4096 received=4096 expected=14088 ms=1.0
 2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.stage read_body_ms=1.2 bytes=14088
 2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.stage save_image_ms=3.4 image_id=... size_bytes=14088
 2026-07-05 18:20:03 INFO [vision_llm] vision.recognition.stage api_call_ms=1820.5
@@ -359,6 +387,7 @@ Compose 保持现有 `8000` 端口和 `.env` 配置方式。详细说明见 [`do
 重点看这几个字段：
 
 - `api_call_ms`：视觉模型本身耗时，通常是图片识别最慢的部分。
+- `camera.upload.receive`：服务端实际收到的请求体进度；如果停止增长，模型尚未被调用。
 - `recognition_ms`：整个识别阶段耗时，包含模型调用和本地解析。
 - `first_token_ms`：聊天首 token 延迟，决定用户感觉“等了多久才开始说话”。
 - `total_ms`：接口总耗时。
@@ -410,8 +439,11 @@ You> /exit
 ```powershell
 .\.venv\Scripts\python.exe camera_upload_cli.py `
   samples\camera\yingguo_jade_eagle_esp32.jpg `
-  --device walkie-01
+  --device walkie-01 `
+  --request-id walkie-01-camera-local-1
 ```
+
+传入 `--request-id` 后，测试客户端会自动计算并发送 `X-Content-SHA256`；模拟同一次弱网重试时必须复用同一个值和同一张图片。
 
 另一张样例图：
 
@@ -667,7 +699,7 @@ AI> 它是平顶山“鹰城”文化的重要象征……
 
 相机图片上传接口。接口会保存 JPEG，并根据请求参数决定识别方式：
 
-- 不传 `artifact_id`：调用 `VISION_MODEL`，当前推荐 `qwen-vl-plus`。
+- 不传 `artifact_id`：调用 `VISION_MODEL`，当前使用 `qwen3.6-flash-2026-04-16`，关闭思考并要求 JSON 输出。
 - 传 `artifact_id`：跳过视觉模型，把它当作人工指定的模拟识别结果，方便对照测试。
 - 传 `use_vision=false`：只保存图片，不识别，并清空该设备旧的 `latest_artifact_id`。
 
@@ -677,9 +709,22 @@ AI> 它是平顶山“鹰城”文化的重要象征……
 
 ```env
 MAX_SAVED_IMAGES_PER_DEVICE=10
+CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS=8
+CAMERA_IDEMPOTENCY_TTL_SECONDS=1200
+CAMERA_IDEMPOTENCY_MAX_RECORDS=1000
+CAMERA_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS=180
+CAMERA_IDEMPOTENCY_POLL_INTERVAL_SECONDS=0.1
 ```
 
 清理只针对 `uploads/{device_id}/` 下的 `.jpg` 图片，不会影响语音请求和回复 WAV。
+
+后端在解析必要参数和请求头后立即流式消费 raw JPEG；完整收完以前不会保存图片、查文物、访问外部模型或执行其他慢任务。`Content-Length` 必须存在且为合法整数，实际字节数必须完全一致，JPEG 最大 8 MiB。连续 8 秒没有任何新字节时返回 HTTP 408；这是“连续无进展”空闲超时，不限制弱网下整次上传的总时长。客户端中途断连或长度不符返回 HTTP 400，空 body 或非法 JPEG 也不会进入视觉识别。
+
+接收阶段的错误响应会携带 `reason / message / received_bytes / expected_bytes`，并发送 `Connection: close`，避免半包请求残留在 HTTP keep-alive 连接中。
+
+新设备应同时发送 `X-Request-ID` 和 `X-Content-SHA256`。SHA-256 是完整 JPEG 的 64 位小写十六进制摘要；摘要不符返回 HTTP 422。相同请求 ID、设备、摘要和长度的并发或后续重试只保存、识别一次，并在同一个 POST 中等待或复用相同最终响应；任一身份字段冲突返回 HTTP 409。旧设备不发送这两个请求头时仍按原逻辑处理，但不具备跨重试幂等保证。
+
+幂等状态保存在 `uploads/camera_idempotency.sqlite3`，默认 TTL 20 分钟、最多 1000 条；过期记录会在后续访问或清理时删除，容量满时优先淘汰最早完成的记录。SQLite 事务使同一共享 `uploads` 文件系统上的多个 worker 也不会重复认图，不过本服务的 `/ai` 会话等其他状态仍要求部署保持单 worker、单副本。
 
 接口形态特意使用 raw JPEG body，而不是 multipart。这样以后 ESP32 C 端更容易对齐：HTTP body 直接发送 JPEG 字节即可。
 
@@ -688,8 +733,21 @@ MAX_SAVED_IMAGES_PER_DEVICE=10
 ```text
 POST /camera/upload?device=walkie-01
 Content-Type: image/jpeg
+Content-Length: 31498
+X-Request-ID: walkie-01-camera-123456-7
+X-Content-SHA256: <完整 JPEG 的 64 位小写 SHA-256>
 
 <JPEG bytes>
+```
+
+设备端遇到写入无进展、连接断开、HTTP 408/5xx 或等待响应超时，应关闭旧连接并指数退避后重发完整 JPEG；重试必须复用同一个 `X-Request-ID`、同一 JPEG 和同一 SHA-256，不能从 12 KB 等中断偏移续传。收到 HTTP 409/422/4xx 参数错误时不要原样重试。完整 JPEG 已到达后即使原连接断开，后端也会继续完成识别，后续相同请求会拿到缓存的最终结果。
+
+阶段日志示例：
+
+```text
+camera.upload.body_received device=walkie-01 request_id=walkie-01-camera-123456-7 content_length=31498 bytes_received=31498 sha256=... stage_ms=842.1 total_ms=842.4 result=complete
+camera.recognition.done device=walkie-01 request_id=walkie-01-camera-123456-7 content_length=31498 bytes_received=31498 sha256=... stage_ms=1468.3 total_ms=2322.8 result=recognized mode=vision_llm
+camera.upload.done device=walkie-01 request_id=walkie-01-camera-123456-7 content_length=31498 bytes_received=31498 sha256=... stage_ms=2323.0 total_ms=2323.0 result=ready image_id=...
 ```
 
 人工标注对照请求：
@@ -763,33 +821,93 @@ AI> 这是应国玉鹰……
 
 它们是测试夹具，不是知识库事实。现在可以直接不传 `artifact_id` 测真实视觉识别，也可以传 `artifact_id` 做人工标注对照。
 
+### JPEG 分片上传：chunk + finish
+
+弱网设备可以把同一 JPEG 拆成多个独立 HTTP POST，每片最多 4096 字节。`POST /camera/upload/chunk` 只校验并持久化分片；最后调用 `POST /camera/upload/finish`，finish 会在同一个请求中校验完整 JPEG、保存图片、执行视觉识别并返回与旧 `/camera/upload` 相同的最终 JSON。没有 start 接口，也没有识别轮询接口。
+
+上传状态不使用客户端 IP 或 TCP 连接，而是由 `request_id + device + total + image_sha256` 唯一绑定。元数据表 `camera_chunk_uploads`、`camera_chunk_parts` 与现有 `camera_idempotency` 共用 `uploads/camera_idempotency.sqlite3`；临时分片文件位于 `uploads/camera_chunks/{device}/<uuid>.jpeg.part`。完整识别后删除临时文件，但保留限时结果记录供 finish 重试。
+
+默认边界：
+
+```env
+CAMERA_CHUNK_SESSION_TTL_SECONDS=600
+CAMERA_CHUNK_COMPLETED_TTL_SECONDS=1200
+CAMERA_CHUNK_MAX_SESSIONS=100
+CAMERA_CHUNK_MAX_TEMP_BYTES=67108864
+CAMERA_CHUNK_CLEANUP_INTERVAL_SECONDS=60
+# CAMERA_CHUNK_TEMP_DIR=uploads/camera_chunks
+```
+
+Linux curl 示例，先准备公共变量并把 JPEG 切成 4096 字节文件：
+
+```bash
+IMAGE=artifact.jpg
+DEVICE=walkie-01
+REQUEST_ID=walkie-01-camera-123
+TOTAL=$(stat -c%s "$IMAGE")
+IMAGE_SHA=$(sha256sum "$IMAGE" | awk '{print $1}')
+split -b 4096 -d -a 4 "$IMAGE" /tmp/camera-chunk-
+```
+
+上传第一片；后续分片只需要递增 `offset`，最后一片可以不足 4096 字节：
+
+```bash
+CHUNK=/tmp/camera-chunk-0000
+OFFSET=0
+CHUNK_SHA=$(sha256sum "$CHUNK" | awk '{print $1}')
+
+curl -X POST \
+  "http://127.0.0.1:18080/camera/upload/chunk?device=$DEVICE&request_id=$REQUEST_ID&offset=$OFFSET&total=$TOTAL" \
+  -H 'Content-Type: application/octet-stream' \
+  -H "X-Image-SHA256: $IMAGE_SHA" \
+  -H "X-Chunk-SHA256: $CHUNK_SHA" \
+  --data-binary "@$CHUNK"
+```
+
+完成上传并同步等待视觉结果：
+
+```bash
+curl -X POST \
+  "http://127.0.0.1:18080/camera/upload/finish?device=$DEVICE&request_id=$REQUEST_ID" \
+  -H "X-Image-SHA256: $IMAGE_SHA"
+```
+
+取消尚未进入识别的上传：
+
+```bash
+curl -X POST \
+  "http://127.0.0.1:18080/camera/upload/cancel?device=$DEVICE&request_id=$REQUEST_ID"
+```
+
+分片响应中的 `next_offset` 是服务器真实进度。重复发送已确认且摘要一致的分片会返回 200、不会重复写入；offset 超前返回 409，设备应从响应的 `next_offset` 继续。finish 正在识别时的重复请求会等待同一个幂等任务，响应丢失后再次 finish 也不会重复调用视觉模型。取消正在识别的任务会返回 `recognition_in_progress`，因为跨 worker 的外部模型请求不能安全强制终止。
+
 ### POST /ai/start
 
-ESP32 语音协议入口。当前后端已经实现分片保存、ASR、LLM、TTS、轮询状态、取消语义和 `result_chunk` 原始 WAV 返回。设备端仍然只需要 HTTP POST；后端内部用 DashScope Paraformer 把 WAV 转成文字，再继续走现有问答和 TTS 链路。
+ESP32 语音协议入口。请求上行兼容旧的 PCM WAV 和新的 AOP1 裸 Opus 帧；回复下行仍为 PCM WAV。
 
 请求：
 
 ```json
-{"device":"walkie-02","language":"zh"}
+{"device":"walkie-02","language":"zh","audio_format":"opus_packets_v1"}
 ```
 
 响应：
 
 ```json
-{"session":"abc123","chunk_size":8192}
+{"ok":true,"session":"abc123","audio_format":"opus_packets_v1","chunk_size":32768}
 ```
 
 后端会用 `device` 绑定语音 session。后续 `/ai/upload`、`/ai/finish`、`/ai/result_info`、`/ai/result_chunk` 即使只传 `session` 也能找到设备上下文；如果设备端额外带 `device=walkie-02`，后端会校验它和 session 里的设备是否一致。
 
 ### POST /ai/upload
 
-上传请求 WAV 分片。所有接口都用 POST。
+上传请求音频分片。`audio_format` 省略时按旧的 `pcm_wav` 处理；新设备使用 `opus_packets_v1`。
 
 ```text
-POST /ai/upload?session=abc123&device=walkie-02&index=0&offset=0&total=1920044
-Content-Type: application/octet-stream
+POST /ai/upload?session=abc123&device=walkie-02&index=0&offset=0&total=156024
+Content-Type: application/vnd.wkt.opus-packets
 
-<WAV bytes chunk>
+<AOP1 bytes chunk>
 ```
 
 响应：
@@ -798,7 +916,11 @@ Content-Type: application/octet-stream
 {"ok":true}
 ```
 
-后端按 `session + offset` 写入文件，当前最大请求 WAV 约 2.1 MB。设备 WAV 必须保持：
+后端按 `session + offset` 写入文件，分片不必与 Opus 包边界对齐。AOP1 最大 256 KiB，格式为 24 字节小端文件头，之后循环保存 `uint16 packet_len + raw Opus packet`。固定参数为 16 kHz、单声道、320 samples/20 ms，每包最大 1275 字节，最长 3000 帧/60 秒。
+
+AOP1 会额外解码一份 WAV 用于静音检测和 Paraformer 回退，因此传统 Python 启动也需要本机 `PATH` 中存在 `ffmpeg`，或通过 `FFMPEG_BIN` 指定；Docker 镜像已经安装。
+
+旧设备的 PCM WAV 最大约 2.1 MB，并继续使用 `application/octet-stream`：
 
 ```text
 Container: WAV
@@ -819,9 +941,9 @@ POST /ai/finish?session=abc123&device=walkie-02
 
 当前版本的处理策略：
 
-- 如果 WAV 无效，返回 `failed`。
-- 如果 WAV 太短或接近静音，返回 `no_speech`，`answer_text` 默认为“我没有听清，请再说一遍。”。
-- 有效语音会调用 `asr.py` 中的 DashScope Paraformer 识别，识别文本写入 `asr_text`。
+- 如果 WAV 或 AOP1 无效，返回 `failed`。
+- 如果音频太短或接近静音，返回 `no_speech`，`answer_text` 默认为“我没有听清，请再说一遍。”。
+- AOP1 会无损封装为 Ogg/Opus；Qwen3-ASR 直接接收 Ogg，Paraformer 回退使用服务端解码的 WAV。
 - ASR 文本进入 LLM 前会经过 `text_normalize.py` 的文物名拼音近似纠错，例如“英国玉婴”“应国玉英”会修正为“应国玉鹰”，再进行本地知识卡匹配。
 - 如果 ASR 配置错误或服务调用失败，返回 `failed`，并通过 `answer_text` 给设备一段可显示的错误提示，避免设备一直轮询。
 - 如果配置了 `AI_MOCK_ASR_TEXT`，后端会跳过真实 ASR，用这段文本调用现有 LLM 编排。
